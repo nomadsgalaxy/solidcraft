@@ -8,6 +8,12 @@
 # Tests are built once and run in 4 shards. A few heavy tests (see .config/nextest.toml) are
 # skipped on pull requests and run on pushes to main and nightly.
 # Cross-compilation is opt-in through Run workflow; release builds remain in release.yml.
+# Pushes to main and merge-queue groups use both pools: Clippy, the test build, the doc tests
+# and test shards 1-2 run on the self-hosted runner (`self-hosted-fast`, warm build directories
+# via scripts/ci/warm-target.sh), everything else on GitHub's runners. Pull requests, the
+# nightly run and Run workflow use GitHub's runners only; the self-hosted runner refuses any
+# job that isn't a push to main or a merge-queue group. Both pools check out at
+# /home/runner/work, so either can run the other's test archive.
 name: CI
 
 on:
@@ -40,7 +46,7 @@ env:
 jobs:
   dependency-advisories:
     name: Dependency advisories
-    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    if: (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && github.ref != 'refs/heads/ci-selfhosted-test'
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
@@ -134,14 +140,19 @@ jobs:
     name: Native Linux Clippy
     needs: changes
     if: needs.changes.outputs.native == 'true'
-    runs-on: ubuntu-24.04
+    runs-on: ${{ (github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.ref == 'refs/heads/ci-selfhosted-test') && 'self-hosted-fast' || 'ubuntu-24.04' }}
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Warm build directory (self-hosted runner)
+        if: runner.environment == 'self-hosted'
+        run: scripts/ci/warm-target.sh clippy
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      # The self-hosted runner keeps its build directory and Cargo home instead.
+      - if: runner.environment == 'github-hosted'
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           key: native-clippy
       - name: Clippy
@@ -158,7 +169,7 @@ jobs:
     name: Build tests
     needs: changes
     if: needs.changes.outputs.native == 'true'
-    runs-on: ubuntu-24.04
+    runs-on: ${{ (github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.ref == 'refs/heads/ci-selfhosted-test') && 'self-hosted-fast' || 'ubuntu-24.04' }}
     timeout-minutes: 45
     env:
       CARGO_INCREMENTAL: "0"
@@ -167,8 +178,13 @@ jobs:
       SCCACHE_IGNORE_SERVER_IO_ERROR: "1"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Warm build directory (self-hosted runner)
+        if: runner.environment == 'self-hosted'
+        run: scripts/ci/warm-target.sh build-tests --link
       - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      # The self-hosted runner keeps its build directory and Cargo home instead.
+      - if: runner.environment == 'github-hosted'
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           key: native-tests
       - name: Set up compiler cache
@@ -200,7 +216,7 @@ jobs:
   tests:
     name: Native Linux tests (${{ matrix.shard }}/4)
     needs: [changes, build-tests]
-    runs-on: ubuntu-24.04
+    runs-on: ${{ ((github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.ref == 'refs/heads/ci-selfhosted-test') && matrix.shard <= 2) && 'self-hosted-fast' || 'ubuntu-24.04' }}
     timeout-minutes: 60
     strategy:
       fail-fast: false
@@ -267,7 +283,7 @@ jobs:
     # tests/action_matrix/costs.json. Keep SHARDS in step with the matrix below.
     name: Action matrix (${{ matrix.shard }}/16)
     needs: build-tests
-    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    if: (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && github.ref != 'refs/heads/ci-selfhosted-test'
     runs-on: ubuntu-24.04
     timeout-minutes: 55
     strategy:
@@ -309,7 +325,7 @@ jobs:
     # A sample of the matrix run twice on one runner: every action must come out the same.
     name: Action matrix determinism
     needs: build-tests
-    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    if: (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && github.ref != 'refs/heads/ci-selfhosted-test'
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     steps:
@@ -331,7 +347,7 @@ jobs:
     # 0..4) and skip boolean_props, whose random inputs would fail main at random.
     name: Property tests (many cases)
     needs: build-tests
-    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    if: (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && github.ref != 'refs/heads/ci-selfhosted-test'
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
@@ -356,7 +372,7 @@ jobs:
     name: Doc tests
     needs: changes
     if: needs.changes.outputs.native == 'true'
-    runs-on: ubuntu-24.04
+    runs-on: ${{ (github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.ref == 'refs/heads/ci-selfhosted-test') && 'self-hosted-fast' || 'ubuntu-24.04' }}
     timeout-minutes: 45
     env:
       CARGO_INCREMENTAL: "0"
@@ -365,8 +381,13 @@ jobs:
       SCCACHE_IGNORE_SERVER_IO_ERROR: "1"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Warm build directory (self-hosted runner)
+        if: runner.environment == 'self-hosted'
+        run: scripts/ci/warm-target.sh doc-tests
       - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      # The self-hosted runner keeps its build directory and Cargo home instead.
+      - if: runner.environment == 'github-hosted'
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           key: doc-tests
       - name: Set up compiler cache
