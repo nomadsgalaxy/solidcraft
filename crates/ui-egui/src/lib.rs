@@ -501,6 +501,7 @@ pub struct SolveApp {
     /// A feature started from a sketch while the marker rolls back, and that sketch: it starts
     /// once the marker is back.
     pub start_after_roll: Option<(String, u64)>,
+    pub(crate) timeline_playback: Option<timeline::Playback>,
     /// A delete's check of what it takes with it or breaks, computing off the window thread
     /// ([`deferred::DeleteCheck`], #2678).
     pub delete_check: Option<deferred::DeleteCheck>,
@@ -693,6 +694,7 @@ impl SolveApp {
             deferred: None,
             deferred_queue: Vec::new(),
             start_after_roll: None,
+            timeline_playback: None,
             delete_check: None,
             apply_off_thread: None,
             #[cfg(test)]
@@ -977,7 +979,11 @@ impl SolveApp {
             solidcraft_engine::slicers::set_chosen_programs(&self.preferences.custom_slicers);
         }
         let t0 = now_ms();
+        let revision = self.session.revision;
         let r = self.session.execute(id, &params).map_err(|e| e.to_string());
+        if self.session.revision != revision {
+            timeline::stop_playback(self);
+        }
         self.big_operation |= now_ms() - t0 >= recovery_ui::BIG_OPERATION_MS;
         self.command_completed(id, r)
     }
@@ -1101,6 +1107,7 @@ impl SolveApp {
                 }
                 if matches!(id, "file.new" | "doc.open" | "doc.recover") {
                     documents::reset_chat(self);
+                    timeline::stop_playback(self);
                     render_workspace::reset_document(self);
                     dim_view::cancel();
                     self.menu.props = None;
@@ -1167,6 +1174,7 @@ impl SolveApp {
     }
 
     fn start_with_variant_memory(&mut self, id: &str, remember_variant: bool, opener: Option<egui::Rect>) {
+        timeline::stop_playback(self);
         if id == "ui.palette" {
             shortcut_box::open(self, None);
             return;
@@ -2154,6 +2162,7 @@ impl SolveApp {
         self.poll_feature_edit(ui.ctx());
         self.poll_deferred(ui.ctx());
         self.poll_delete_check(ui.ctx());
+        timeline::tick_playback(self, ui.ctx());
         if !self.embedded {
             toolbar::app_bar(self, ui);
         }

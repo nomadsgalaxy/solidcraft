@@ -1,0 +1,18 @@
+{
+  "de": {
+    "ui.history_play": "Bis zum Ende abspielen",
+    "ui.history_stop": "Wiedergabe stoppen"
+  },
+  "en": {
+    "ui.history_stop": "Stop playback"
+  },
+  "ja": {
+    "ui.history_stop": "再生を停止"
+  },
+  "ko": {
+    "ui.history_stop": "재생 중지"
+  },
+  "zh": {
+    "ui.history_stop": "停止播放"
+  }
+}

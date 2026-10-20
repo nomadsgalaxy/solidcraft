@@ -92,7 +92,9 @@
   back, and drag features to reorder them. Preferences can put the timeline vertically at the
   far left of the viewport, beside the browser. Its seam handle switches between icon
   chips and compact feature names; the browser can collapse to a rail beside either width.
-  Previous, Play and Next sit at the top. Double-click Previous to roll to the start.
+  Navigation buttons jump to the beginning or end, or step one feature at a time. The separate
+  Play button advances through the remaining features, pausing half a second after each rebuilt
+  step appears. Click Stop or press Escape to stop playback; navigation and editing stop it too.
   Interface › **Sketches** › **Under their feature** lists a sketch in the vertical timeline one
   level in, under the first feature built from it, behind that feature's fold arrow. Dragging the
   feature takes its sketch along. A later feature built from the same sketch gets a row that

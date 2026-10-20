@@ -246,6 +246,7 @@ spun	false
 star	false
 status_error	false
 status_recovery	false
+stop	false
 style	false
 suppress	false
 surface	false
