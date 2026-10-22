@@ -10,6 +10,7 @@
 use serde_json::{Value, json};
 use solidcraft_io::Format;
 
+use super::easyprint::{Exported, export_bodies};
 use super::export_to;
 use crate::params::bad;
 use crate::slicers::{self, Slicer, TargetKind};
@@ -84,28 +85,10 @@ pub(super) fn send(s: &mut Session, r: Send<'_>) -> Result<Value> {
     Ok(out)
 }
 
-/// Write the bodies (the selected ones when none are named) into the slicer folder. A 3MF that can't
-/// be written is written as an STL, and the answer says so.
+/// Write the bodies into the slicer folder.
 fn write_in_folder(s: &mut Session, r: &Send<'_>) -> Result<Value> {
     use crate::slicer_files;
-    let mut bodies = r.bodies.clone();
-    if bodies.is_empty() {
-        bodies = s.selection.iter().filter_map(|x| if let crate::Sel::Body { name } = x { Some(name.clone()) } else { None }).collect();
-    }
-    if bodies.is_empty() {
-        return Err(bad(r.cmd, "select the bodies to send, or give `bodies`"));
-    }
-    let doc = s.doc.painted(&s.world_state());
-    let write = |format| solidcraft_io::export_with_metadata(&doc, &bodies, format, &s.doc.name, &s.doc.metadata);
-    let mut fell_back = false;
-    let (bytes, ext) = match (r.format, write(r.format)) {
-        (_, Ok(b)) => (b, if r.format == Format::StlBinary { "stl" } else { "3mf" }),
-        (Format::ThreeMf, Err(_)) => {
-            fell_back = true;
-            (write(Format::StlBinary)?, "stl")
-        }
-        (_, Err(e)) => return Err(e.into()),
-    };
+    let Exported { bytes, ext, fell_back, bodies } = export_bodies(s, r.cmd, &r.bodies, r.format)?;
     let dir = slicer_files::dir().ok_or_else(|| bad(r.cmd, "no per-user folder on this system"))?;
     let stem = slicer_files::stem(&s.doc.name, s.path.as_deref(), s.uid, &bodies);
     let (file, numbered) = slicer_files::write(&dir, &stem, ext, &bytes).map_err(|e| EngineError::Other(format!("{}: {e}", dir.display())))?;

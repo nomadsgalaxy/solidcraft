@@ -469,3 +469,72 @@ fn send_to_slicer_writes_3mf_and_starts_the_program_with_it() {
     std::fs::remove_dir_all(std::path::Path::new(&file).parent().unwrap()).unwrap();
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+type Uploads = std::sync::Arc<std::sync::Mutex<Vec<(String, Vec<u8>)>>>;
+
+/// A session whose "host" records what it is handed and answers `answer`.
+fn easyprint_host(s: &mut Session, answer: std::result::Result<(), String>) -> Uploads {
+    let seen = Uploads::default();
+    let log = seen.clone();
+    s.easyprint_upload = Some(std::sync::Arc::new(move |name, bytes| {
+        log.lock().unwrap().push((name.to_string(), bytes));
+        answer.clone()
+    }));
+    seen
+}
+
+#[test]
+fn open_in_easyprint_hands_the_host_a_3mf_or_an_stl_that_reads_back() {
+    let mut s = imported_box();
+    let seen = easyprint_host(&mut s, Ok(()));
+    let r = s.execute("file.open_in_easyprint", &json!({"consent": true, "bodies": ["Mesh"]})).unwrap();
+    assert_eq!(r["uploading"], true);
+    s.execute("file.open_in_easyprint", &json!({"consent": true, "bodies": ["Mesh"], "format": "stl"})).unwrap();
+    let seen = seen.lock().unwrap();
+    assert_eq!((seen[0].0.ends_with(".3mf"), seen[1].0.ends_with(".stl")), (true, true), "{:?}", seen.iter().map(|u| &u.0).collect::<Vec<_>>());
+    assert!(seen[0].1.starts_with(b"PK"), "a 3MF is a zip");
+    // A binary STL: 80-byte header, a count, 50 bytes a triangle, and a box has 12.
+    assert_eq!(seen[1].1.len(), 84 + 50 * 12);
+}
+
+#[test]
+fn open_in_easyprint_without_consent_a_host_or_bodies_uploads_nothing() {
+    let mut s = imported_box();
+    let e = s.execute("file.open_in_easyprint", &json!({"consent": true, "bodies": ["Mesh"]})).unwrap_err().to_string();
+    assert!(e.contains("not supported yet"), "{e}");
+    let seen = easyprint_host(&mut s, Ok(()));
+    assert!(s.execute("file.open_in_easyprint", &json!({"bodies": ["Mesh"]})).is_err());
+    assert!(s.execute("file.open_in_easyprint", &json!({"consent": false, "bodies": ["Mesh"]})).is_err());
+    assert!(s.execute("file.open_in_easyprint", &json!({"consent": true})).is_err(), "nothing selected, nothing named");
+    assert!(s.execute("file.open_in_easyprint", &json!({"consent": true, "bodies": ["Mesh"], "format": "step"})).is_err());
+    assert!(seen.lock().unwrap().is_empty());
+}
+
+#[test]
+fn open_in_easyprint_reports_a_host_that_cannot_start_and_a_model_over_the_limit() {
+    let mut s = imported_box();
+    let seen = easyprint_host(&mut s, Err("no network".into()));
+    let e = s.execute("file.open_in_easyprint", &json!({"consent": true, "bodies": ["Mesh"]})).unwrap_err().to_string();
+    assert!(e.contains("no network"), "{e}");
+    // An STL is 50 bytes a triangle: 2.1 million of them are over 100 MB.
+    let mut doc = Document::default();
+    doc.add_feature(
+        FeatureKind::MeshImport {
+            file: "big.stl".into(),
+            meshes: vec![MeshData {
+                name: "Big".into(),
+                positions: vec![0., 0., 0., 1., 0., 0., 0., 1., 0.].into(),
+                triangles: [0u32, 1, 2].repeat(2_100_000).into(),
+                color: None,
+            }],
+        },
+        Some("Imported mesh"),
+    )
+    .unwrap();
+    let mut big = Session::new(doc);
+    let seen_big = easyprint_host(&mut big, Ok(()));
+    let e = big.execute("file.open_in_easyprint", &json!({"consent": true, "bodies": ["Big"], "format": "stl"})).unwrap_err().to_string();
+    assert!(e.contains("100 MB at most"), "{e}");
+    assert!(seen_big.lock().unwrap().is_empty());
+    assert_eq!(seen.lock().unwrap().len(), 1);
+}

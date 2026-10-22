@@ -59,6 +59,14 @@ with a `slicer`, which sends without a dialog. They can start only the slicers i
 list and programs you added under **Custom…**; any other program path is refused, and an AI agent's
 request to save a mesh or send it to a slicer asks first and names the slicer.
 
+The list also has a plain **EasyPrint (Printables, in the browser)** row, and it is the one entry
+that works in the browser build too. EasyPrint is Printables' slicer, so choosing it uploads the
+selected bodies (a 3MF, 100 MB at most) to Printables' servers and opens the model there in your
+browser. The link expires after 30 minutes, and you need to be signed in to Printables. SolidCraft
+asks once before the first upload and remembers that you agreed. Nothing is uploaded unless you pick
+this row. SolidCraft isn't affiliated with Printables. Scripts use `file.open_in_easyprint`, which refuses unless it gets `consent: true`,
+and an AI agent's request to use it asks first.
+
 Files sent to a slicer go to a folder only you can
 read: `~/.cache/solidcraft/slicer` on Linux, `~/Library/Caches/SolidCraft/slicer` on macOS and
 `%LOCALAPPDATA%\SolidCraft\slicer` on Windows. The name stays the same for the same design and

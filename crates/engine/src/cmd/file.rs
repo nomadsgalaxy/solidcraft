@@ -3,6 +3,9 @@
 #[path = "file_thumbnail.rs"]
 mod thumbnail;
 
+#[path = "file_easyprint.rs"]
+mod easyprint;
+
 #[path = "file_import.rs"]
 pub(crate) mod import;
 
@@ -64,6 +67,10 @@ pub static COMMANDS: &[CommandSpec] = &[
         .icon("mesh_export")
         .noundo()
         .params("slicer: id or name from file.slicers, or a program the user added under Custom…; bodies?: [names] (default: the selected bodies); wait?: block|return|no (default block: a slicer that drops a file at a cold start is started alone and the call waits up to 10 s for it to be ready, then sends; return: start it and answer {starting}; no: send now); single_instance?: bool (default true: PrusaSlicer, SuperSlicer and Cura load the file in the window that is open); format?: 3mf|stl|3mf-tagged (default 3mf, in millimetres; STL if that can't be written) → saves the bodies in this user's slicer folder and opens the file in the slicer. The file name stays the same for the same design and bodies, so sending again replaces it (use the slicer's Reload from disk)"),
+    CommandSpec::new("file.open_in_easyprint", "Open with EasyPrint", easyprint::open_in_easyprint)
+        .icon("mesh_export")
+        .noundo()
+        .params("consent: bool (required: true only once the user has agreed to upload the model to Printables' servers; it stays there for 30 minutes and opening it needs a Printables sign-in); bodies?: [names] (default: the selected bodies); format?: 3mf|stl (default 3mf, in millimetres) → uploads the bodies to EasyPrint, Printables' slicer in the browser, and opens it in the browser. 100 MB at most. Works in the desktop app and the browser build; the CLI has no way to upload yet"),
     CommandSpec::new("file.slicers", "Installed Slicers", slicers).icon("export")
         .noundo()
         .params("→ the slicers found on this machine: [{id, name, program, icon?}]; pass an id, a name or the program path as file.send_to_slicer's or file.save_mesh's `slicer`"),

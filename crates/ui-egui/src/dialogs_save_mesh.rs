@@ -1,6 +1,7 @@
 //! The Save as mesh dialog (`file.save_mesh`): which bodies and the mesh format, then a file dialog.
 //! Send to Slicer (`file.send_to_slicer`) shares the dialog without the format and with a slicer to
-//! send the bodies to: it always asks, and pre-selects the slicer used last time.
+//! send the bodies to: it always asks, and pre-selects the slicer used last time. The list also has
+//! a plain text row for EasyPrint (`file.open_in_easyprint`), which works in a browser too.
 //!
 //! Every place that saves a mesh opens this dialog: File › Export STL / Export 3MF, the Mesh tab, and the
 //! Save As Mesh item of the body menus. The slicer list (Send to Slicer only) holds the programs the user added (kept
@@ -24,6 +25,8 @@ use crate::theme::Tokens;
 /// The formats, as shown and as `file.save_mesh` names them.
 /// (label, `format` parameter, file extension).
 const FORMATS: [(&str, &str, &str); 3] = [("STL", "stl", "stl"), ("3MF", "3mf", "3mf"), ("3MF with face tags", "3mf-tagged", "3mf")];
+/// The list key of the EasyPrint row (no slicer has it: ids are words, programs are paths).
+const EASYPRINT: &str = "easyprint";
 /// Edge of a slicer's icon in the list.
 const ICON: f32 = 16.0;
 /// Most programs the user can keep in the list.
@@ -109,19 +112,23 @@ impl SlicerMenu {
 pub fn start(app: &SolveApp, id: &str) -> Option<(Kind, Vec<SelInput>)> {
     let open = match id {
         "file.save_mesh" => false,
-        "file.send_to_slicer" => true,
+        "file.send_to_slicer" | "file.open_in_easyprint" => true,
         _ => return None,
     };
     let p = &app.preferences;
     let format = FORMATS.iter().position(|f| f.1 == p.save_mesh_format).unwrap_or(0);
-    let slicer = if open { p.send_slicer.clone() } else { String::new() };
+    let slicer = match id {
+        "file.open_in_easyprint" => EASYPRINT.into(),
+        _ if open => p.send_slicer.clone(),
+        _ => String::new(),
+    };
     let kind = Kind::SaveMesh(SaveMesh { format, open, slicer, stale: true });
     Some((kind, vec![SelInput::new("Bodies", BODIES, true)]))
 }
 
-/// Send to Slicer needs a way to start a program: a browser has none.
+/// Send to Slicer needs a way to start a program (a browser has none) or a way to reach EasyPrint.
 pub fn available(app: &SolveApp) -> bool {
-    app.services.pick_program.is_some()
+    app.services.pick_program.is_some() || crate::easyprint_ui::available(app)
 }
 
 /// A slicer that was started alone and is being waited for, off the UI thread, until it can take
@@ -302,11 +309,16 @@ pub fn rows(app: &mut SolveApp, ui: &mut egui::Ui, k: &mut SaveMesh) -> bool {
         app.slicer_menu.picked = None;
         app.slicer_menu.refresh(&app.preferences.custom_slicers);
         let entries = app.slicer_menu.entries();
-        k.slicer = app.slicer_menu.key_for(&k.slicer).or_else(|| entries.first().map(|e| e.key.clone())).unwrap_or_default();
-    }
-    // A browser has no installed programs to send a file to.
-    if app.services.pick_program.is_none() {
-        return false;
+        let easyprint = crate::easyprint_ui::available(app);
+        k.slicer = if easyprint && k.slicer == EASYPRINT {
+            EASYPRINT.into()
+        } else {
+            app.slicer_menu
+                .key_for(&k.slicer)
+                .or_else(|| entries.first().map(|e| e.key.clone()))
+                .or_else(|| easyprint.then(|| EASYPRINT.to_string()))
+                .unwrap_or_default()
+        };
     }
 
     form_row(ui, "Slicer", |ui| {
@@ -327,7 +339,13 @@ fn slicer_combo(app: &mut SolveApp, ui: &mut egui::Ui, k: &mut SaveMesh) {
     let ctx = ui.ctx().clone();
     let current = entries.iter().find(|e| e.key == k.slicer);
     let pad = "\u{2003}\u{2003}";
-    let text = current.map_or_else(|| crate::i18n::tr_label("No slicer found").to_string(), |e| format!("{pad}{}", e.slicer.name));
+    let easyprint = crate::easyprint_ui::available(app);
+    let easyprint_label = crate::i18n::tr("ui.easyprint_row");
+    let text = match current {
+        Some(e) => format!("{pad}{}", e.slicer.name),
+        None if easyprint && k.slicer == EASYPRINT => format!("{pad}{easyprint_label}"),
+        None => crate::i18n::tr_label("No slicer found").to_string(),
+    };
     let mut pick_custom = false;
     let mut delete: Option<String> = None;
     let mut chosen: Option<String> = None;
@@ -365,8 +383,26 @@ fn slicer_combo(app: &mut SolveApp, ui: &mut egui::Ui, k: &mut SaveMesh) {
                 ui.close();
             }
         }
-        if !entries.is_empty() {
+        if easyprint {
+            let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 22.0), Sense::click());
+            if resp.hovered() || k.slicer == EASYPRINT {
+                let fill = if resp.hovered() { Tokens::get().hover } else { Tokens::get().selected_bg };
+                ui.painter().rect_filled(rect, 2.0, fill);
+            }
+            let text = fitted(ui, easyprint_label, rect.width() - (ICON + 9.0) - 6.0, Tokens::get().text);
+            ui.painter().galley(rect.left_center() + vec2(ICON + 9.0, -text.size().y / 2.0), text, Tokens::get().text);
+            crate::scenario::publish_handle("dialog:Slicer:EasyPrint", rect.center());
+            if resp.clicked() {
+                chosen = Some(EASYPRINT.to_string());
+                ui.close();
+            }
+        }
+        if !entries.is_empty() || easyprint {
             ui.separator();
+        }
+        // A browser has no program to add.
+        if app.services.pick_program.is_none() {
+            return;
         }
         let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 22.0), Sense::click());
         if resp.hovered() {
@@ -438,8 +474,11 @@ pub fn commands(k: &SaveMesh, inputs: &[SelInput]) -> Result<Vec<(String, Value)
         if k.slicer.is_empty() {
             return Err(crate::i18n::tr("ui.save_mesh_no_slicer_open").into());
         }
-        p["slicer"] = json!(k.slicer);
         p["format"] = json!("3mf");
+        if k.slicer == EASYPRINT {
+            return Ok(vec![("file.open_in_easyprint".into(), p)]);
+        }
+        p["slicer"] = json!(k.slicer);
         return Ok(vec![("file.send_to_slicer".into(), p)]);
     }
     Ok(vec![("file.save_mesh".into(), p)])
@@ -466,7 +505,11 @@ pub fn run(app: &mut SolveApp, k: &SaveMesh, inputs: &[SelInput]) -> Result<(), 
     let (_, params) = commands(k, inputs)?.into_iter().next().ok_or("nothing to save")?;
     if k.open {
         app.preferences.send_slicer = k.slicer.clone();
-        send_to_slicer(app, params);
+        if k.slicer == EASYPRINT {
+            crate::easyprint_ui::request(app, params);
+        } else {
+            send_to_slicer(app, params);
+        }
         return Ok(());
     }
     let (format, ext) = FORMATS.get(k.format).map_or(("stl", "stl"), |f| (f.1, f.2));

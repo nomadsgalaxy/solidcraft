@@ -127,6 +127,10 @@ pub fn command(id: &str, params: &Value, undo_left: usize) -> Verdict {
             Some(slicer) => format!("{question}, send to {}", slicer.chars().take(200).collect::<String>()),
             None => question,
         };
+    // The model leaves the machine: the user is asked, whatever the agent says about consent.
+    if id == "file.open_in_easyprint" {
+        return Verdict::Ask(format!("{id}, upload the model to Printables' servers (EasyPrint)"));
+    }
     if let Some(p) = names_a_file(id, params) {
         return Verdict::Ask(with_slicer(format!("{id}: {p}")));
     }
@@ -265,6 +269,9 @@ mod tests {
         );
         assert!(
             matches!(exec("file.send_to_slicer", json!({"slicer": "prusa", "bodies": ["Part"]})), Verdict::Ask(a) if a.ends_with("send to prusa"))
+        );
+        assert!(
+            matches!(exec("file.open_in_easyprint", json!({"bodies": ["Part"], "consent": true})), Verdict::Ask(a) if a.contains("upload the model"))
         );
         assert!(matches!(exec("file.send_to_slicer", json!({})), Verdict::Ask(_)));
     }

@@ -556,6 +556,8 @@ preference_settings! {
     slicer_single_instance: bool = true, 0;
     /// The line about sending again replacing the slicer's file has been shown.
     slicer_resend_hint_seen: bool = false;
+    /// The user has agreed to Open with EasyPrint uploading a model to Printables' servers.
+    easyprint_consent: bool = false;
     /// The programs the user added to the slicer list, newest first.
     custom_slicers: Vec<String> = Vec::new();
     /// AI features (docs/agent-chat.md): the master switch. Off: no AI button, shortcut, menu
