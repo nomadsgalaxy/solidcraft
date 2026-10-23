@@ -469,6 +469,9 @@ preference_settings! {
     /// The grid turns to the upright origin plane facing a side view (#1470). Off by default: the
     /// grid stays on the ground plane (XY) whatever the view.
     grid_follows_view: bool = false => check("Grid follows the view", "Side views show the grid on the upright plane facing them instead of the ground");
+    /// Draw reference geometry such as inactive sketches and datum planes through shaded bodies.
+    /// Off by default to preserve the depth-tested viewport behaviour.
+    reference_geometry_through_bodies: bool = false, PAGE_GRAPHICS => check_id("settings.reference_geometry_through_bodies");
     /// How finely the viewport tessellates curved faces and edges: `coarse`, `normal`, `fine` or
     /// `ultra` (#1287). Only the display plan the viewport draws; never the design or exports.
     display_quality: String = "normal".into(), PAGE_GRAPHICS;
@@ -529,9 +532,6 @@ preference_settings! {
     look_at_speed: f32 = 1.0, PAGE_NAVIGATION, accept(0.25..=4.0) => enabled_slider(look_at_anim, "Animation speed", 0.5..=3.0, 0.25, |v| format!("{v:.2}×"));
     /// Default modelling orientation: `z` (Z up) or `y` (Y up) (#3).
     up_axis: String = "z".into(), PAGE_DESIGN;
-    /// A STEP or IGES file whose header names a Y-up exporter (SolidWorks) is stood up as it
-    /// opens, with an Undo in the toast (`stand_up`).
-    auto_stand_up: bool = true, PAGE_DESIGN => check("Stand up Y-up files automatically", "A STEP or IGES file from a program that saves Y up opens standing, with Undo in the message");
     /// After a STEP or IGES file opens, offer to stand a Y-up part up (`stand_up`).
     offer_stand_up: bool = true, PAGE_DESIGN => check("Offer to stand up Y-up files", "After a STEP or IGES file opens with Z up, offer a quarter turn about X");
     /// What a middle-button double-click in the view does: `home`, `fit` or `off`.
