@@ -46,7 +46,7 @@ panel, and in the right-click menu of a body) open the same dialog with that for
 the selected bodies as STL, 3MF or 3MF with face tags (below) to a file you name, and you can change
 the format there.
 
-**File → Send to Slicer** (also on the Mesh tab under Modify, and in the right-click menu of a
+**File → Send to Slicer** (also on the Insert tab's Files panel, and in the right-click menu of a
 body) is the short way: it saves the selected bodies as a 3MF in millimetres, without face tags,
 and sends it to a slicer. It always asks which one and pre-selects the slicer you used last time,
 so the usual case is one click or Enter. The list shows the slicers found on the computer with their
