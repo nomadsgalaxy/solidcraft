@@ -2661,6 +2661,27 @@ mod tests {
         assert!(too_wide.is_empty(), "{}", too_wide.join("\n"));
     }
 
+    /// The widest of the card's button labels stays well inside the narrowest card (346 px wide at a 760 px
+    /// window, less its padding) in every language, so a button never has to be wider than its card.
+    #[test]
+    fn the_offers_buttons_fit_the_narrowest_card_in_every_language() {
+        let ctx = crate::fonts::test_context();
+        ctx.run_ui(egui::RawInput::default(), |_| {}).textures_delta.clear();
+        let font = egui::FontId::proportional(crate::theme::Tokens::get().font_label);
+        let mut wide = Vec::new();
+        for catalog in crate::i18n::LOCALES {
+            use crate::space_mouse_offer::Action;
+            for key in [Action::Swap, Action::Calibrate, Action::Never, Action::Close].map(|action| action.label()) {
+                let label = crate::i18n::Locale::for_language(catalog.id).text(key).to_string();
+                let width = ctx.fonts_mut(|fonts| fonts.layout_no_wrap(label.clone(), font.clone(), egui::Color32::WHITE).size().x);
+                if width > 250.0 {
+                    wide.push(format!("{} {key} \"{label}\" is {width:.0} px", catalog.id));
+                }
+            }
+        }
+        assert!(wide.is_empty(), "{}", wide.join("\n"));
+    }
+
     /// The circles' tooltips come from the one function the rows' labels come from, after a
     /// reassignment, for both kinds of driver mapping (and none), and an inverted axis reads the same.
     #[test]
