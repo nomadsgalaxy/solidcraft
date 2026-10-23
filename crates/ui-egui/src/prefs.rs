@@ -1313,7 +1313,15 @@ const FORM_LABEL_WIDTH: f32 = 150.0;
 
 fn space_mouse_rows(app: &mut SolveApp, ui: &mut egui::Ui) {
     let t = Tokens::get();
-    setting::space_mouse_enabled(app, ui);
+    ui.horizontal_wrapped(|ui| {
+        setting::space_mouse_enabled(app, ui);
+        let device = app.space_mouse.device.as_ref();
+        let saved = device.is_some_and(|device| app.preferences.space_mouse_calibrations.contains_key(device));
+        if let Some(device) = device {
+            let state = app.tr(if saved { "ui.3d_mouse_calibrated" } else { "ui.3d_mouse_not_calibrated" });
+            ui_kit::settings_badge(ui, &format!("{state} · {device}"), !saved);
+        }
+    });
     setting::space_mouse_in_view(app, ui).on_hover_text(crate::i18n::tr("ui.3d_mouse_show_in_view_tip"));
     // Where the picture goes, a choice that waits on the checkbox above.
     let names: Vec<(SpaceMouseGhost, String)> = [
@@ -1416,14 +1424,18 @@ fn space_mouse_rows(app: &mut SolveApp, ui: &mut egui::Ui) {
                 }
             });
             let not_allowed = found_but_not_allowed(app.space_mouse.drivers);
-            let status = match (&device, saved) {
-                (None, _) if not_allowed => app.tr("ui.3d_mouse_denied_short").to_owned(),
-                (None, _) if waiting_for_a_record(app.space_mouse.drivers) => app.tr("ui.3d_mouse_calibrate_wait").to_owned(),
-                (None, _) => app.tr("ui.3d_mouse_none").to_owned(),
-                (Some(device), true) => format!("{} ({device})", app.tr("ui.3d_mouse_calibrated")),
-                (Some(device), false) => format!("{} ({device})", app.tr("ui.3d_mouse_not_calibrated")),
+            // With a device, the badge beside the toggle above says this.
+            if device.is_some() {
+                return;
+            }
+            let status = if not_allowed {
+                app.tr("ui.3d_mouse_denied_short")
+            } else if waiting_for_a_record(app.space_mouse.drivers) {
+                app.tr("ui.3d_mouse_calibrate_wait")
+            } else {
+                app.tr("ui.3d_mouse_none")
             };
-            let status_line = ui_kit::text(ui, &status, ui_kit::Text::Report("calibration_status", false));
+            let status_line = ui_kit::text(ui, status, ui_kit::Text::Report("calibration_status", false));
             // Nothing confirmed yet (none found, or waiting for the first record): a hint to try, as a
             // tooltip here and, while a reader is waiting for the first record, as a line below.
             if device.is_none() && !not_allowed {
@@ -1466,107 +1478,71 @@ fn space_mouse_rows(app: &mut SolveApp, ui: &mut egui::Ui) {
             (text, label == "ui.3d_mouse_view_off")
         })
         .collect();
-    let (driven_by, driven_by_label) = (app.tr("ui.3d_mouse_driven_by").to_owned(), app.tr("ui.3d_mouse_driven_by_label").to_owned());
+    let driven_by = app.tr("ui.3d_mouse_driven_by").to_owned();
     let off_tip = app.tr("ui.3d_mouse_view_off_tip").to_owned();
     let motions: Vec<String> = crate::space_mouse::MOTIONS.iter().map(|motion| app.tr(motion).to_owned()).collect();
-    // One row per view axis: Invert, Speed, and the motion that drives it, in columns of exact
-    // widths: Invert and the motion choice are fixed, the slider takes what is left. Where
-    // that would leave the slider under `AXIS_SLIDER_MIN`, the motion choice goes on a row of
-    // its own under it. Each row decides from the width it is given.
+    // The axes are a table of their own: each row is a live meter of the motion that drives that
+    // view axis, then its Invert, Speed and the motion choice.
     let enabled = app.preferences.space_mouse_enabled;
-    let space_x = ui.spacing().item_spacing.x;
-    // Whether the slider keeps its minimum beside the other columns, steady against a scrollbar
-    // appearing (which narrows every row a little): `key` names the row.
-    let slider_width = |ui: &egui::Ui, key: usize, control: f32| {
-        let fixed = AXIS_INVERT_WIDTH + AXIS_DRIVEN_WIDTH + 2.0 * space_x;
-        ui_kit::fits_steadily(ui, ("axis_row", key), fixed + AXIS_SLIDER_MIN, control).then(|| (control - fixed).max(0.0))
-    };
-    let cell = |ui: &mut egui::Ui, width: f32, add: &mut dyn FnMut(&mut egui::Ui)| {
-        ui.allocate_ui_with_layout(egui::vec2(width, ui_kit::row_height()), egui::Layout::left_to_right(egui::Align::Center), |ui| add(ui)).response
-    };
-    ui_kit::settings_form(ui, FORM_LABEL_WIDTH, |ui| {
-        ui_kit::row(ui, app.tr("ui.3d_mouse_view_axis"), |ui| {
-            if let Some(slider) = slider_width(ui, usize::MAX, ui.available_width()) {
-                ui.horizontal(|ui| {
-                    cell(ui, AXIS_INVERT_WIDTH, &mut |ui| {
-                        ui_kit::text(ui, crate::i18n::tr_label("Invert"), ui_kit::Text::Hint("space_mouse_col_invert"));
-                    });
-                    cell(ui, slider, &mut |ui| {
-                        ui_kit::text(ui, crate::i18n::tr_label("Speed"), ui_kit::Text::Hint("space_mouse_col_speed"));
-                    });
-                    cell(ui, AXIS_DRIVEN_WIDTH, &mut |ui| {
-                        ui_kit::text(ui, &driven_by_label, ui_kit::Text::Hint("space_mouse_col_driven_by"));
-                    });
-                });
-            }
-        });
-        for (axis, (name, off)) in rows.iter().enumerate() {
+    let raw: [i16; 6] = app.space_mouse.raw.into();
+    // Frames come on input, so a reading that moved since the last one gets a frame to show it.
+    let seen = ui.id().with("space_mouse_meter_raw");
+    let before = ui.data_mut(|data| data.get_temp::<[i16; 6]>(seen));
+    ui.data_mut(|data| data.insert_temp(seen, raw));
+    if before.is_some_and(|before| before != raw) {
+        ui.ctx().request_repaint();
+    }
+    let calibration = app.space_mouse.device.as_ref().and_then(|device| app.preferences.space_mouse_calibrations.get(device));
+    let meters: [_; 6] = std::array::from_fn(|axis| axis_meter(calibration, raw, app.preferences.space_mouse_axis_source, axis));
+    ui_kit::settings_axis_header(ui);
+    for (axis, (name, off)) in rows.iter().enumerate() {
+        ui.push_id(("space_mouse_axis", axis), |ui| {
+            let (value, zone) = meters[axis];
             let prefs = &mut app.preferences;
-            let (reverse, speed, source) = (&mut prefs.space_mouse_reverse, &mut prefs.space_mouse_axis_speed, &mut prefs.space_mouse_axis_source);
-            let (motions, driven_by) = (&motions, &driven_by);
-            let mut driven = |ui: &mut egui::Ui| {
-                ui.add_enabled_ui(enabled, |ui| {
-                    let current = source.get(axis).copied().unwrap_or(axis);
-                    let mut chosen = current;
-                    ui_kit::dropdown_menu(ui, ("sc_space_mouse_source", axis), motions.get(current).map_or("", String::as_str), |ui| {
-                        for (from, name) in motions.iter().enumerate() {
-                            if ui_kit::list_picker(ui, name, name, chosen == from).clicked() {
-                                chosen = from;
-                            }
-                        }
-                    })
-                    .on_hover_text(driven_by.as_str());
-                    if chosen != current {
-                        crate::space_mouse::reassign(source, axis, chosen);
-                    }
-                });
-            };
-            let mut wrapped = false;
-            let group = ui_kit::row(ui, name, |ui| {
-                let control = ui.available_width();
-                let slider = slider_width(ui, axis, control);
-                wrapped = slider.is_none();
+            let (reverse, speed, source) =
+                (prefs.space_mouse_reverse.get_mut(axis), prefs.space_mouse_axis_speed.get_mut(axis), &mut prefs.space_mouse_axis_source);
+            ui_kit::settings_axis_row(
+                ui,
+                name,
+                value,
+                zone,
                 // Invert and speed do nothing on a row the driver turns off. The motion choice
                 // stays live, so a motion can still be swapped out of it.
-                let mut invert = |ui: &mut egui::Ui| {
+                |ui| {
                     ui.add_enabled_ui(enabled && !off, |ui| {
-                        if let Some(reverse) = reverse.get_mut(axis) {
+                        if let Some(reverse) = reverse {
                             ui_kit::checkbox(ui, crate::i18n::tr_label("Invert"), reverse);
                         }
                     });
-                };
-                let mut speed_slider = |ui: &mut egui::Ui| {
+                },
+                |ui| {
                     ui.add_enabled_ui(enabled && !off, |ui| {
-                        if let Some(speed) = speed.get_mut(axis) {
-                            ui_kit::slider(
-                                ui,
-                                speed,
-                                0.0..=3.0,
-                                ui_kit::Slider { step: Some(0.05), format: |v| format!("{v:.2}×"), ..Default::default() },
-                            );
+                        if let Some(speed) = speed {
+                            ui_kit::settings_axis_gain(ui, speed);
                         }
                     });
-                };
-                ui.horizontal(|ui| {
-                    let first = cell(ui, AXIS_INVERT_WIDTH, &mut invert);
-                    let rest = slider.unwrap_or_else(|| (control - AXIS_INVERT_WIDTH - space_x).max(0.0));
-                    let second = cell(ui, rest, &mut speed_slider);
-                    if slider.is_some() {
-                        cell(ui, AXIS_DRIVEN_WIDTH, &mut driven);
-                    }
-                    first.union(second)
-                })
-                .inner
-            });
-            if *off {
-                group.on_hover_text(&off_tip);
-            }
-            if wrapped {
-                ui_kit::row(ui, "", |ui| {
-                    cell(ui, AXIS_DRIVEN_WIDTH.min(ui.available_width()), &mut driven);
-                });
-            }
-        }
+                },
+                |ui| {
+                    ui.add_enabled_ui(enabled, |ui| {
+                        let current = source.get(axis).copied().unwrap_or(axis);
+                        let mut chosen = current;
+                        ui_kit::dropdown_menu(ui, ("sc_space_mouse_source", axis), motions.get(current).map_or("", String::as_str), |ui| {
+                            for (from, name) in motions.iter().enumerate() {
+                                if ui_kit::list_picker(ui, name, name, chosen == from).clicked() {
+                                    chosen = from;
+                                }
+                            }
+                        })
+                        .on_hover_text(if *off { &off_tip } else { &driven_by });
+                        if chosen != current {
+                            crate::space_mouse::reassign(source, axis, chosen);
+                        }
+                    });
+                },
+            );
+        });
+    }
+    ui_kit::settings_form(ui, FORM_LABEL_WIDTH, |ui| {
         ui_kit::row(ui, "", |ui| {
             let reassigned = app.preferences.space_mouse_axis_source != crate::space_mouse::SAME_AXES;
             ui.add_enabled_ui(app.preferences.space_mouse_enabled && reassigned, |ui| {
@@ -1622,11 +1598,21 @@ fn space_mouse_rows(app: &mut SolveApp, ui: &mut egui::Ui) {
     let _ = t;
 }
 
-/// The columns of a view axis's row: Invert and the motion choice have fixed widths; the slider
-/// takes the rest, and when that is under `AXIS_SLIDER_MIN` the motion choice wraps to its own row.
-const AXIS_INVERT_WIDTH: f32 = 76.0;
+/// The width of the "driven by" choice.
 const AXIS_DRIVEN_WIDTH: f32 = 140.0;
-const AXIS_SLIDER_MIN: f32 = 150.0;
+
+/// Where the motion that drives view axis `axis` sits, as a share of its full travel (calibrated
+/// when the device has a calibration, else the raw reading over full scale), and the share of that
+/// travel which reads as no motion on each side, for the live meter in its row.
+fn axis_meter(calibration: Option<&solidcraft_space_mouse::Calibration>, raw: [i16; 6], source: [usize; 6], axis: usize) -> (f32, [f32; 2]) {
+    let from = source.get(axis).copied().unwrap_or(axis);
+    match calibration {
+        Some(calibration) => {
+            (calibration.travel(raw).get(from).copied().unwrap_or(0.0), calibration.dead_zone_shares().get(from).copied().unwrap_or_default())
+        }
+        None => (f32::from(raw.get(from).copied().unwrap_or(0)) / f32::from(crate::space_mouse::FULL_SCALE), [0.0; 2]),
+    }
+}
 
 /// Whether a reader is reachable (spacenavd's socket, or a 3D mouse hidraw lists) that has not yet
 /// sent a record: the device is not confirmed until it does, so Preferences asks for a movement
@@ -2341,6 +2327,22 @@ mod tests {
             }
         }
         assert!(report.is_empty(), "{}", report.join("\n"));
+    }
+
+    /// The meter in a view axis row shows the motion chosen in its "driven by" menu, calibrated or not.
+    #[test]
+    fn an_axis_meter_follows_the_motion_that_drives_it() {
+        let raw = [0, 0, 0, 175, 0, 0];
+        let full = f32::from(crate::space_mouse::FULL_SCALE);
+        let mut source = crate::space_mouse::SAME_AXES;
+        assert_eq!(axis_meter(None, raw, source, 2).0, 0.0, "Zoom reads its own motion");
+        crate::space_mouse::reassign(&mut source, 2, 3);
+        assert_eq!(axis_meter(None, raw, source, 2), (175.0 / full, [0.0; 2]), "Zoom now shows Rotation X");
+        assert_eq!(axis_meter(None, raw, source, 3).0, 0.0, "and the row that gave Rotation X up shows what it took in exchange");
+        let axes =
+            std::array::from_fn(|source| solidcraft_space_mouse::AxisCalibration { source, reversed: false, rest: 0, dead_zone: 0, full: [350; 2] });
+        let calibration = solidcraft_space_mouse::Calibration { dead_zone_share: 0.2, kind: solidcraft_space_mouse::Kind::ReturnToCenter, axes };
+        assert_eq!(axis_meter(Some(&calibration), raw, source, 2), (0.5, [0.2; 2]), "calibrated: share of travel, with the dead zone");
     }
 
     /// Restore defaults for the 3D mouse section puts back what it lists, and nothing else.
