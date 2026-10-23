@@ -2507,16 +2507,16 @@ mod tests {
         h.call("ui.resize", serde_json::json!({"width": 1600, "height": 4000}));
         crate::prefs::open_at(&mut h.app, crate::prefs::PAGE_NAVIGATION);
         h.frames(36);
-        let drawn = |h: &crate::scenario::Harness, name: &str| crate::scenario::rect_of(&format!("dialog:row:{name}")).is_some();
+        let drawn = |name: &str| crate::scenario::rect_of(&format!("dialog:row:{name}")).is_some();
         let (driver, axes) = (crate::i18n::tr("ui.3d_mouse_driver"), crate::i18n::tr("ui.3d_mouse_button").replace("{number}", "1"));
-        assert!(drawn(&h, "Calibration") && drawn(&h, "Overall speed"), "everyday controls are always there");
-        assert!(!drawn(&h, &driver) && !drawn(&h, &axes), "closed: no driver row, no buttons");
+        assert!(drawn("Calibration") && drawn("Overall speed"), "everyday controls are always there");
+        assert!(!drawn(driver) && !drawn(&axes), "closed: no driver row, no buttons");
         assert!(crate::scenario::rect_of("dialog:section:Advanced").is_some());
         open_advanced(&mut h);
-        assert!(drawn(&h, &driver), "open: the driver row");
+        assert!(drawn(driver), "open: the driver row");
         assert!(crate::scenario::rect_of("dialog:button::Restore defaults").is_some(), "open: the restore button");
         open_advanced(&mut h);
-        assert!(!drawn(&h, &driver), "closed again");
+        assert!(!drawn(driver), "closed again");
     }
 
     /// The question is short, says what stays, and exists in every language.
