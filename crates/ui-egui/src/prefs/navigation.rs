@@ -170,8 +170,7 @@ pub(super) fn show(app: &mut SolveApp, ui: &mut egui::Ui, t: &Tokens) {
         // The existing ring editor is part of the real product and remains available.
         crate::mouse_gesture::nav_rows(app, ui, t);
     });
-    // The 3D mouse is its own section: a folded header with the device, then the driver, calibration,
-    // axes, buttons and the picture (`prefs::space_mouse_section`).
-    ui.add_space(Tokens::get().space_8);
+    // The 3D mouse is a section like the ones above: the driver, calibration, axes, picture and buttons
+    // (`prefs::space_mouse_section`).
     space_mouse_section(app, ui);
 }
