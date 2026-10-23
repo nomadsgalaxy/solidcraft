@@ -74,7 +74,7 @@ pub struct Input {
     pub offer_seen: f64,
     /// The device last written to the log (one line per connect), `None` for none.
     pub logged_device: Option<String>,
-    /// "Restore 3D Mouse Defaults" was clicked and waits for its answer.
+    /// "Restore defaults" was clicked and waits for its answer.
     pub restore_pending: bool,
     /// The last look at the buttons had no state yet (`Buttons::pending`).
     pub buttons_pending: bool,

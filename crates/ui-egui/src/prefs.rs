@@ -1313,16 +1313,25 @@ const FORM_LABEL_WIDTH: f32 = 150.0;
 
 fn space_mouse_rows(app: &mut SolveApp, ui: &mut egui::Ui) {
     let t = Tokens::get();
-    ui.horizontal_wrapped(|ui| {
-        setting::space_mouse_enabled(app, ui);
-        let device = app.space_mouse.device.as_ref();
-        let saved = device.is_some_and(|device| app.preferences.space_mouse_calibrations.contains_key(device));
-        if let Some(device) = device {
-            let state = app.tr(if saved { "ui.3d_mouse_calibrated" } else { "ui.3d_mouse_not_calibrated" });
-            ui_kit::settings_badge(ui, &format!("{state} · {device}"), !saved);
-        }
+    // The two checkboxes sit in the two-column grid Wheel and trackpad uses (`navigation.rs`).
+    let width = (ui.available_width() - (t.space_16 + t.space_4)) * 0.5;
+    ui.horizontal_top(|ui| {
+        ui.spacing_mut().item_spacing.x = t.space_16 + t.space_4;
+        ui.allocate_ui_with_layout(egui::vec2(width, 0.0), egui::Layout::top_down(egui::Align::Min), |ui| {
+            ui.horizontal_wrapped(|ui| {
+                setting::space_mouse_enabled(app, ui);
+                let device = app.space_mouse.device.as_ref();
+                let saved = device.is_some_and(|device| app.preferences.space_mouse_calibrations.contains_key(device));
+                if let Some(device) = device {
+                    let state = app.tr(if saved { "ui.3d_mouse_calibrated" } else { "ui.3d_mouse_not_calibrated" });
+                    ui_kit::settings_badge(ui, &format!("{state} · {device}"), !saved);
+                }
+            });
+        });
+        ui.allocate_ui_with_layout(egui::vec2(width, 0.0), egui::Layout::top_down(egui::Align::Min), |ui| {
+            setting::space_mouse_in_view(app, ui).on_hover_text(crate::i18n::tr("ui.3d_mouse_show_in_view_tip"));
+        });
     });
-    setting::space_mouse_in_view(app, ui).on_hover_text(crate::i18n::tr("ui.3d_mouse_show_in_view_tip"));
     // Where the picture goes, a choice that waits on the checkbox above.
     let names: Vec<(SpaceMouseGhost, String)> = [
         (SpaceMouseGhost::LeftViewport, "ui.3d_mouse_ghost_left_viewport"),
@@ -1357,50 +1366,6 @@ fn space_mouse_rows(app: &mut SolveApp, ui: &mut egui::Ui) {
                 );
             });
         });
-    });
-    ui_kit::divider(ui, "space_mouse_device");
-    ui_kit::settings_form(ui, FORM_LABEL_WIDTH, |ui| {
-        // Only where the reader has seen the choice: Linux, with spacenavd and the device both there.
-        if let Some(present) = app.space_mouse.drivers.filter(|present| present.spacenavd || (present.direct && !present.denied)) {
-            let [label, auto, direct, only_spacenavd, only_direct] =
-                ["driver", "driver_auto", "driver_direct", "driver_only_spacenavd", "driver_only_direct"]
-                    .map(|key| app.tr(&format!("ui.3d_mouse_{key}")).to_owned());
-            let driver = &mut app.preferences.space_mouse_driver;
-            ui_kit::row(ui, &label, |ui| match (present.spacenavd, present.direct) {
-                (true, true) => {
-                    let name = |driver| match driver {
-                        SpaceMouseDriver::Automatic => auto.as_str(),
-                        SpaceMouseDriver::Spacenavd => "spacenavd",
-                        SpaceMouseDriver::Direct => direct.as_str(),
-                    };
-                    ui_kit::settings_control_width(ui, AXIS_DRIVEN_WIDTH, |ui| {
-                        ui_kit::dropdown_menu(ui, "sc_space_mouse_driver", name(*driver), |ui| {
-                            for choice in SpaceMouseDriver::ALL {
-                                if ui_kit::list_picker(ui, name(choice), name(choice), *driver == choice).clicked() {
-                                    *driver = choice;
-                                }
-                            }
-                        });
-                    });
-                }
-                (true, false) => {
-                    ui_kit::text(ui, &only_spacenavd, ui_kit::Text::Hint("space_mouse_driver"));
-                }
-                (false, _) => {
-                    ui_kit::text(ui, &only_direct, ui_kit::Text::Hint("space_mouse_driver"));
-                }
-            });
-        }
-        // The setting says what was asked for; this says what is read when that is not it: Direct or
-        // Automatic with the daemon read because the device itself could not be opened.
-        if let Some(present) = app.space_mouse.drivers
-            && present.spacenavd
-            && present.direct
-            && app.preferences.space_mouse_driver != SpaceMouseDriver::Spacenavd
-            && app.space_mouse.device.as_deref() == Some("spacenavd")
-        {
-            ui_kit::text(ui, app.tr("ui.3d_mouse_driver_fallback"), ui_kit::Text::Hint("space_mouse_driver_fallback"));
-        }
         ui_kit::row(ui, app.tr("ui.3d_mouse_calibration"), |ui| {
             let device = app.space_mouse.device.clone();
             let saved = device.as_ref().is_some_and(|device| app.preferences.space_mouse_calibrations.contains_key(device));
@@ -1445,157 +1410,215 @@ fn space_mouse_rows(app: &mut SolveApp, ui: &mut egui::Ui) {
         if app.space_mouse.device.is_none() {
             if found_but_not_allowed(app.space_mouse.drivers) {
                 // Wiggling will not help: the device is there and SolidCraft may not read it.
-                ui_kit::text(ui, app.tr("ui.3d_mouse_denied"), ui_kit::Text::Hint("space_mouse_denied"));
+                hint_under_controls(ui, app.tr("ui.3d_mouse_denied"), "space_mouse_denied");
             } else {
-                ui_kit::text(ui, app.tr("ui.3d_mouse_wiggle"), ui_kit::Text::Hint("space_mouse_wiggle"));
+                hint_under_controls(ui, app.tr("ui.3d_mouse_wiggle"), "space_mouse_wiggle");
             }
         }
+    });
+    // The rarely needed settings sit behind one disclosure, closed until the reader opens it.
+    ui_kit::section(ui, "space_mouse_advanced", crate::i18n::tr_label("Advanced"), false, |ui| {
+        ui_kit::settings_form(ui, FORM_LABEL_WIDTH, |ui| {
+            // Only where the reader has seen the choice: Linux, with spacenavd and the device both there.
+            if let Some(present) = app.space_mouse.drivers.filter(|present| present.spacenavd || (present.direct && !present.denied)) {
+                let [label, auto, direct, only_spacenavd, only_direct] =
+                    ["driver", "driver_auto", "driver_direct", "driver_only_spacenavd", "driver_only_direct"]
+                        .map(|key| app.tr(&format!("ui.3d_mouse_{key}")).to_owned());
+                let driver = &mut app.preferences.space_mouse_driver;
+                ui_kit::row(ui, &label, |ui| match (present.spacenavd, present.direct) {
+                    (true, true) => {
+                        let name = |driver| match driver {
+                            SpaceMouseDriver::Automatic => auto.as_str(),
+                            SpaceMouseDriver::Spacenavd => "spacenavd",
+                            SpaceMouseDriver::Direct => direct.as_str(),
+                        };
+                        ui_kit::settings_control_width(ui, AXIS_DRIVEN_WIDTH, |ui| {
+                            ui_kit::dropdown_menu(ui, "sc_space_mouse_driver", name(*driver), |ui| {
+                                for choice in SpaceMouseDriver::ALL {
+                                    if ui_kit::list_picker(ui, name(choice), name(choice), *driver == choice).clicked() {
+                                        *driver = choice;
+                                    }
+                                }
+                            });
+                        });
+                    }
+                    (true, false) => {
+                        ui_kit::text(ui, &only_spacenavd, ui_kit::Text::Hint("space_mouse_driver"));
+                    }
+                    (false, _) => {
+                        ui_kit::text(ui, &only_direct, ui_kit::Text::Hint("space_mouse_driver"));
+                    }
+                });
+            }
+            // The setting says what was asked for; this says what is read when that is not it: Direct or
+            // Automatic with the daemon read because the device itself could not be opened.
+            if let Some(present) = app.space_mouse.drivers
+                && present.spacenavd
+                && present.direct
+                && app.preferences.space_mouse_driver != SpaceMouseDriver::Spacenavd
+                && app.space_mouse.device.as_deref() == Some("spacenavd")
+            {
+                hint_under_controls(ui, app.tr("ui.3d_mouse_driver_fallback"), "space_mouse_driver_fallback");
+            }
+            let enabled = app.preferences.space_mouse_enabled;
+            let (label, tip) = (app.tr("ui.3d_mouse_dead_zone").to_owned(), app.tr("ui.3d_mouse_dead_zone_tip").to_owned());
+            let device = app.space_mouse.device.clone();
+            if let Some(calibration) = device.and_then(|device| app.preferences.space_mouse_calibrations.get_mut(&device)) {
+                ui_kit::row(ui, &label, |ui| {
+                    ui.add_enabled_ui(enabled, |ui| {
+                        ui_kit::slider(
+                            ui,
+                            &mut calibration.dead_zone_share,
+                            0.0..=solidcraft_space_mouse::MAX_DEAD_ZONE_SHARE,
+                            ui_kit::Slider { step: Some(0.01), format: |v| format!("{:.0} %", v * 100.0), ..Default::default() },
+                        )
+                        .on_hover_text(tip);
+                    });
+                });
+            }
+        });
+        ui_kit::divider(ui, "space_mouse_axes");
+        // Rows say what they do to the view, through the mapping navigation uses; the choices
+        // are the device's calibrated motions. Neither names a kind of device.
+        let mapping = app.space_mouse.mapping;
+        let rows: Vec<(String, bool)> = (0..6)
+            .map(|row| {
+                let label = crate::space_mouse::row_label(mapping, row);
+                let text = crate::i18n::Locale::for_language(&app.preferences.language).format(label, &[("n", &(row + 1).to_string())]);
+                (text, label == "ui.3d_mouse_view_off")
+            })
+            .collect();
+        let driven_by = app.tr("ui.3d_mouse_driven_by").to_owned();
+        let off_tip = app.tr("ui.3d_mouse_view_off_tip").to_owned();
+        let motions: Vec<String> = crate::space_mouse::MOTIONS.iter().map(|motion| app.tr(motion).to_owned()).collect();
+        // The axes are a table of their own: each row is a live meter of the motion that drives that
+        // view axis, then its Invert, Speed and the motion choice.
         let enabled = app.preferences.space_mouse_enabled;
-        let (label, tip) = (app.tr("ui.3d_mouse_dead_zone").to_owned(), app.tr("ui.3d_mouse_dead_zone_tip").to_owned());
-        let device = app.space_mouse.device.clone();
-        if let Some(calibration) = device.and_then(|device| app.preferences.space_mouse_calibrations.get_mut(&device)) {
-            ui_kit::row(ui, &label, |ui| {
-                ui.add_enabled_ui(enabled, |ui| {
-                    ui_kit::slider(
-                        ui,
-                        &mut calibration.dead_zone_share,
-                        0.0..=solidcraft_space_mouse::MAX_DEAD_ZONE_SHARE,
-                        ui_kit::Slider { step: Some(0.01), format: |v| format!("{:.0} %", v * 100.0), ..Default::default() },
-                    )
-                    .on_hover_text(tip);
+        let raw: [i16; 6] = app.space_mouse.raw.into();
+        // Frames come on input, so a reading that moved since the last one gets a frame to show it.
+        let seen = ui.id().with("space_mouse_meter_raw");
+        let before = ui.data_mut(|data| data.get_temp::<[i16; 6]>(seen));
+        ui.data_mut(|data| data.insert_temp(seen, raw));
+        if before.is_some_and(|before| before != raw) {
+            ui.ctx().request_repaint();
+        }
+        let calibration = app.space_mouse.device.as_ref().and_then(|device| app.preferences.space_mouse_calibrations.get(device));
+        let meters: [_; 6] = std::array::from_fn(|axis| axis_meter(calibration, raw, app.preferences.space_mouse_axis_source, axis));
+        ui_kit::settings_axis_header(ui);
+        for (axis, (name, off)) in rows.iter().enumerate() {
+            ui.push_id(("space_mouse_axis", axis), |ui| {
+                let (value, zone) = meters[axis];
+                let prefs = &mut app.preferences;
+                let (reverse, speed, source) =
+                    (prefs.space_mouse_reverse.get_mut(axis), prefs.space_mouse_axis_speed.get_mut(axis), &mut prefs.space_mouse_axis_source);
+                ui_kit::settings_axis_row(
+                    ui,
+                    name,
+                    value,
+                    zone,
+                    // Invert and speed do nothing on a row the driver turns off. The motion choice
+                    // stays live, so a motion can still be swapped out of it.
+                    |ui| {
+                        ui.add_enabled_ui(enabled && !off, |ui| {
+                            if let Some(reverse) = reverse {
+                                ui_kit::checkbox(ui, crate::i18n::tr_label("Invert"), reverse);
+                            }
+                        });
+                    },
+                    |ui| {
+                        ui.add_enabled_ui(enabled && !off, |ui| {
+                            if let Some(speed) = speed {
+                                ui_kit::settings_axis_gain(ui, speed);
+                            }
+                        });
+                    },
+                    |ui| {
+                        ui.add_enabled_ui(enabled, |ui| {
+                            let current = source.get(axis).copied().unwrap_or(axis);
+                            let mut chosen = current;
+                            ui_kit::dropdown_menu(ui, ("sc_space_mouse_source", axis), motions.get(current).map_or("", String::as_str), |ui| {
+                                for (from, name) in motions.iter().enumerate() {
+                                    if ui_kit::list_picker(ui, name, name, chosen == from).clicked() {
+                                        chosen = from;
+                                    }
+                                }
+                            })
+                            .on_hover_text(if *off { &off_tip } else { &driven_by });
+                            if chosen != current {
+                                crate::space_mouse::reassign(source, axis, chosen);
+                            }
+                        });
+                    },
+                );
+            });
+        }
+        ui_kit::settings_form(ui, FORM_LABEL_WIDTH, |ui| {
+            ui_kit::row(ui, "", |ui| {
+                let reassigned = app.preferences.space_mouse_axis_source != crate::space_mouse::SAME_AXES;
+                ui.add_enabled_ui(app.preferences.space_mouse_enabled && reassigned, |ui| {
+                    if ui_kit::button(ui, app.tr("ui.3d_mouse_reset_axes"), ui_kit::Button::Normal).clicked() {
+                        app.preferences.space_mouse_axis_source = crate::space_mouse::SAME_AXES;
+                    }
                 });
             });
-        }
-    });
-    ui_kit::divider(ui, "space_mouse_axes");
-    // Rows say what they do to the view, through the mapping navigation uses; the choices
-    // are the device's calibrated motions. Neither names a kind of device.
-    let mapping = app.space_mouse.mapping;
-    let rows: Vec<(String, bool)> = (0..6)
-        .map(|row| {
-            let label = crate::space_mouse::row_label(mapping, row);
-            let text = crate::i18n::Locale::for_language(&app.preferences.language).format(label, &[("n", &(row + 1).to_string())]);
-            (text, label == "ui.3d_mouse_view_off")
-        })
-        .collect();
-    let driven_by = app.tr("ui.3d_mouse_driven_by").to_owned();
-    let off_tip = app.tr("ui.3d_mouse_view_off_tip").to_owned();
-    let motions: Vec<String> = crate::space_mouse::MOTIONS.iter().map(|motion| app.tr(motion).to_owned()).collect();
-    // The axes are a table of their own: each row is a live meter of the motion that drives that
-    // view axis, then its Invert, Speed and the motion choice.
-    let enabled = app.preferences.space_mouse_enabled;
-    let raw: [i16; 6] = app.space_mouse.raw.into();
-    // Frames come on input, so a reading that moved since the last one gets a frame to show it.
-    let seen = ui.id().with("space_mouse_meter_raw");
-    let before = ui.data_mut(|data| data.get_temp::<[i16; 6]>(seen));
-    ui.data_mut(|data| data.insert_temp(seen, raw));
-    if before.is_some_and(|before| before != raw) {
-        ui.ctx().request_repaint();
-    }
-    let calibration = app.space_mouse.device.as_ref().and_then(|device| app.preferences.space_mouse_calibrations.get(device));
-    let meters: [_; 6] = std::array::from_fn(|axis| axis_meter(calibration, raw, app.preferences.space_mouse_axis_source, axis));
-    ui_kit::settings_axis_header(ui);
-    for (axis, (name, off)) in rows.iter().enumerate() {
-        ui.push_id(("space_mouse_axis", axis), |ui| {
-            let (value, zone) = meters[axis];
-            let prefs = &mut app.preferences;
-            let (reverse, speed, source) =
-                (prefs.space_mouse_reverse.get_mut(axis), prefs.space_mouse_axis_speed.get_mut(axis), &mut prefs.space_mouse_axis_source);
-            ui_kit::settings_axis_row(
-                ui,
-                name,
-                value,
-                zone,
-                // Invert and speed do nothing on a row the driver turns off. The motion choice
-                // stays live, so a motion can still be swapped out of it.
-                |ui| {
-                    ui.add_enabled_ui(enabled && !off, |ui| {
-                        if let Some(reverse) = reverse {
-                            ui_kit::checkbox(ui, crate::i18n::tr_label("Invert"), reverse);
-                        }
-                    });
-                },
-                |ui| {
-                    ui.add_enabled_ui(enabled && !off, |ui| {
-                        if let Some(speed) = speed {
-                            ui_kit::settings_axis_gain(ui, speed);
-                        }
-                    });
-                },
-                |ui| {
-                    ui.add_enabled_ui(enabled, |ui| {
-                        let current = source.get(axis).copied().unwrap_or(axis);
-                        let mut chosen = current;
-                        ui_kit::dropdown_menu(ui, ("sc_space_mouse_source", axis), motions.get(current).map_or("", String::as_str), |ui| {
-                            for (from, name) in motions.iter().enumerate() {
-                                if ui_kit::list_picker(ui, name, name, chosen == from).clicked() {
-                                    chosen = from;
-                                }
-                            }
-                        })
-                        .on_hover_text(if *off { &off_tip } else { &driven_by });
-                        if chosen != current {
-                            crate::space_mouse::reassign(source, axis, chosen);
-                        }
-                    });
-                },
-            );
+            // Restore this section's settings (after asking); the calibration, the button mapping and the
+            // test model are not touched.
+            if app.space_mouse.restore_pending {
+                // A short question on its own, not in a row (a row has one line's height and cut it off), so
+                // that it wraps to its whole height at any width; the buttons are under it.
+                hint_under_controls(ui, app.tr("ui.3d_mouse_restore_ask"), "space_mouse_restore_ask");
+                ui_kit::row(ui, "", |ui| {
+                    if ui_kit::button(ui, app.tr("ui.3d_mouse_restore"), ui_kit::Button::Normal).clicked() {
+                        restore_space_mouse_defaults(app);
+                        app.space_mouse.restore_pending = false;
+                    }
+                    if ui_kit::button(ui, app.tr("ui.cancel"), ui_kit::Button::Normal).clicked() {
+                        app.space_mouse.restore_pending = false;
+                    }
+                });
+            } else {
+                ui_kit::row(ui, "", |ui| {
+                    if ui_kit::button(ui, app.tr("ui.3d_mouse_restore"), ui_kit::Button::Normal).clicked() {
+                        app.space_mouse.restore_pending = true;
+                    }
+                });
+            }
         });
-    }
-    ui_kit::settings_form(ui, FORM_LABEL_WIDTH, |ui| {
-        ui_kit::row(ui, "", |ui| {
-            let reassigned = app.preferences.space_mouse_axis_source != crate::space_mouse::SAME_AXES;
-            ui.add_enabled_ui(app.preferences.space_mouse_enabled && reassigned, |ui| {
-                if ui_kit::button(ui, app.tr("ui.3d_mouse_reset_axes"), ui_kit::Button::Normal).clicked() {
-                    app.preferences.space_mouse_axis_source = crate::space_mouse::SAME_AXES;
-                }
-            });
-        });
-        // Restore this section's settings (after asking); the calibration, the button mapping and the
-        // test model are not touched.
-        if app.space_mouse.restore_pending {
-            // A short question on its own, not in a row (a row has one line's height and cut it off), so
-            // that it wraps to its whole height at any width; the buttons are under it.
-            ui_kit::text(ui, app.tr("ui.3d_mouse_restore_ask"), ui_kit::Text::Hint("space_mouse_restore_ask"));
-            ui_kit::row(ui, "", |ui| {
-                if ui_kit::button(ui, app.tr("ui.3d_mouse_restore"), ui_kit::Button::Normal).clicked() {
-                    restore_space_mouse_defaults(app);
-                    app.space_mouse.restore_pending = false;
-                }
-                if ui_kit::button(ui, app.tr("ui.cancel"), ui_kit::Button::Normal).clicked() {
-                    app.space_mouse.restore_pending = false;
-                }
-            });
-        } else {
-            ui_kit::row(ui, "", |ui| {
-                if ui_kit::button(ui, app.tr("ui.3d_mouse_restore"), ui_kit::Button::Normal).clicked() {
-                    app.space_mouse.restore_pending = true;
-                }
-            });
+        // The calibrated device moving as it does, with the test model beside it, then its dead zones.
+        let (device, raw) = (app.space_mouse.device.clone(), app.space_mouse.raw.into());
+        let (boat, motion, reverse) = (&mut app.space_mouse.boat, app.space_mouse.motion, (app.preferences.zoom_reverse, app.preferences.free_orbit));
+        if let Some(calibration) = device.as_ref().and_then(|device| app.preferences.space_mouse_calibrations.get_mut(device)) {
+            ui_kit::divider(ui, "space_mouse_picture");
+            // Under each circle's axes, what the view does with them: the rows' own labels.
+            let stories = crate::space_mouse::stories(&app.preferences.language, mapping, app.preferences.space_mouse_axis_source);
+            let help = crate::i18n::tr("ui.3d_mouse_circles_help").to_string();
+            let pads = |ui: &mut egui::Ui| {
+                crate::space_mouse_calibration::dead_zone_pads(ui, calibration, raw, false, &stories);
+                ui_kit::text(ui, &help, ui_kit::Text::Hint("space_mouse_circles_help"));
+            };
+            picture_and_boat(ui, boat, motion, reverse, true, |ui| crate::space_mouse_model::live(ui, calibration, raw), pads);
+        } else if device.is_some() {
+            // Not calibrated: the test model alone.
+            ui_kit::divider(ui, "space_mouse_picture");
+            picture_and_boat(ui, boat, motion, reverse, false, |_| {}, |_| {});
         }
+        ui_kit::settings_form(ui, FORM_LABEL_WIDTH, |ui| {
+            hint_under_controls(ui, crate::i18n::tr_label("Move and rotate the view together; sketches use pan and zoom only."), "space_mouse");
+        });
+        ui_kit::divider(ui, "space_mouse_buttons");
+        space_mouse_buttons(app, ui);
     });
-    // The calibrated device moving as it does, with the test model beside it, then its dead zones.
-    let (device, raw) = (app.space_mouse.device.clone(), app.space_mouse.raw.into());
-    let (boat, motion, reverse) = (&mut app.space_mouse.boat, app.space_mouse.motion, (app.preferences.zoom_reverse, app.preferences.free_orbit));
-    if let Some(calibration) = device.as_ref().and_then(|device| app.preferences.space_mouse_calibrations.get_mut(device)) {
-        ui_kit::divider(ui, "space_mouse_picture");
-        // Under each circle's axes, what the view does with them: the rows' own labels.
-        let stories = crate::space_mouse::stories(&app.preferences.language, mapping, app.preferences.space_mouse_axis_source);
-        let help = crate::i18n::tr("ui.3d_mouse_circles_help").to_string();
-        let pads = |ui: &mut egui::Ui| {
-            crate::space_mouse_calibration::dead_zone_pads(ui, calibration, raw, false, &stories);
-            ui_kit::text(ui, &help, ui_kit::Text::Hint("space_mouse_circles_help"));
-        };
-        picture_and_boat(ui, boat, motion, reverse, true, |ui| crate::space_mouse_model::live(ui, calibration, raw), pads);
-    } else if device.is_some() {
-        // Not calibrated: the test model alone.
-        ui_kit::divider(ui, "space_mouse_picture");
-        picture_and_boat(ui, boat, motion, reverse, false, |_| {}, |_| {});
-    }
-    ui_kit::text(ui, crate::i18n::tr_label("Move and rotate the view together; sketches use pan and zoom only."), ui_kit::Text::Hint("space_mouse"));
-    ui_kit::divider(ui, "space_mouse_buttons");
-    space_mouse_buttons(app, ui);
-    let _ = t;
+}
+
+/// A hint in the control column of the forms above and below it, as the form rows' controls are,
+/// not at the section's left edge.
+fn hint_under_controls(ui: &mut egui::Ui, text: &str, key: &str) {
+    let indent = FORM_LABEL_WIDTH.min(ui.available_width() * 0.6) + Tokens::get().space_14;
+    ui.horizontal_top(|ui| {
+        ui.spacing_mut().item_spacing.x = 0.0;
+        ui.add_space(indent);
+        ui_kit::text(ui, text, ui_kit::Text::Hint(key));
+    });
 }
 
 /// The width of the "driven by" choice.
@@ -1689,18 +1712,19 @@ fn picture_and_boat(
 /// The 3D mouse's buttons, each with what it does: those that do something and any pressed since
 /// the app started. A pressed one is marked in its row; Preferences doesn't run them.
 fn space_mouse_buttons(app: &mut SolveApp, ui: &mut egui::Ui) {
-    ui_kit::text(ui, crate::i18n::tr("ui.3d_mouse_buttons"), ui_kit::Text::Heading("space_mouse_buttons"));
     let Some(device) = app.space_mouse.device.clone() else {
-        ui_kit::text(ui, crate::i18n::tr("ui.3d_mouse_buttons_no_device"), ui_kit::Text::Hint("space_mouse_buttons"));
+        ui_kit::settings_form(ui, FORM_LABEL_WIDTH, |ui| {
+            hint_under_controls(ui, crate::i18n::tr("ui.3d_mouse_buttons_no_device"), "space_mouse_buttons");
+        });
         return;
     };
-    ui_kit::text(ui, crate::i18n::tr("ui.3d_mouse_buttons_hint"), ui_kit::Text::Hint("space_mouse_buttons"));
     let mut jobs = crate::space_mouse::button_jobs(app, &device);
     let bit = |number: u8| number.checked_sub(1).and_then(|index| 1_u32.checked_shl(u32::from(index))).unwrap_or(0);
     let mut numbers: std::collections::BTreeSet<u8> = jobs.keys().copied().collect();
     numbers.extend((1..=32).filter(|&number| app.space_mouse.seen & bit(number) != 0));
     let mut changed = false;
     ui_kit::settings_form(ui, FORM_LABEL_WIDTH, |ui| {
+        hint_under_controls(ui, crate::i18n::tr("ui.3d_mouse_buttons_hint"), "space_mouse_buttons");
         for number in numbers {
             let mut name = crate::i18n::format("ui.3d_mouse_button", &[("number", &number.to_string())]);
             if app.space_mouse.buttons & bit(number) != 0 {
@@ -1719,10 +1743,14 @@ fn space_mouse_buttons(app: &mut SolveApp, ui: &mut egui::Ui) {
     if changed {
         app.preferences.space_mouse_buttons.insert(device.clone(), jobs);
     }
-    if app.preferences.space_mouse_buttons.contains_key(&device)
-        && ui_kit::button(ui, crate::i18n::tr("ui.3d_mouse_buttons_reset"), ui_kit::Button::Normal).clicked()
-    {
-        app.preferences.space_mouse_buttons.remove(&device);
+    if app.preferences.space_mouse_buttons.contains_key(&device) {
+        ui_kit::settings_form(ui, FORM_LABEL_WIDTH, |ui| {
+            ui_kit::row(ui, "", |ui| {
+                if ui_kit::button(ui, crate::i18n::tr("ui.3d_mouse_buttons_reset"), ui_kit::Button::Normal).clicked() {
+                    app.preferences.space_mouse_buttons.remove(&device);
+                }
+            });
+        });
     }
 }
 
@@ -2409,7 +2437,37 @@ mod tests {
         h.call("ui.resize", serde_json::json!({"width": 1600, "height": 4000}));
         crate::prefs::open_at(&mut h.app, crate::prefs::PAGE_NAVIGATION);
         h.frames(36);
+        open_advanced(&mut h);
         h
+    }
+
+    /// Opens the section's "Advanced" disclosure, which starts closed. Once per harness: it toggles.
+    fn open_advanced(h: &mut crate::scenario::Harness) {
+        scroll_to_and_click(h, "dialog:section:Advanced");
+        h.frames(10);
+    }
+
+    /// The driver, dead zone, axis table and buttons are rarely needed, so they start folded away and
+    /// are not drawn until the reader opens "Advanced"; the everyday controls are there either way.
+    #[test]
+    fn the_advanced_3d_mouse_settings_start_folded_away() {
+        let mut h = crate::scenario::Harness::new();
+        h.app.home.open = false;
+        h.app.space_mouse.device = Some("hid 046d:c62b".into());
+        h.app.space_mouse.drivers = Some(crate::space_mouse::DriversPresent { spacenavd: true, direct: true, denied: false });
+        h.call("ui.resize", serde_json::json!({"width": 1600, "height": 4000}));
+        crate::prefs::open_at(&mut h.app, crate::prefs::PAGE_NAVIGATION);
+        h.frames(36);
+        let drawn = |h: &crate::scenario::Harness, name: &str| crate::scenario::rect_of(&format!("dialog:row:{name}")).is_some();
+        let (driver, axes) = (crate::i18n::tr("ui.3d_mouse_driver"), crate::i18n::tr("ui.3d_mouse_button").replace("{number}", "1"));
+        assert!(drawn(&h, "Calibration") && drawn(&h, "Overall speed"), "everyday controls are always there");
+        assert!(!drawn(&h, &driver) && !drawn(&h, &axes), "closed: no driver row, no buttons");
+        assert!(crate::scenario::rect_of("dialog:section:Advanced").is_some());
+        open_advanced(&mut h);
+        assert!(drawn(&h, &driver), "open: the driver row");
+        assert!(crate::scenario::rect_of("dialog:button::Restore defaults").is_some(), "open: the restore button");
+        open_advanced(&mut h);
+        assert!(!drawn(&h, &driver), "closed again");
     }
 
     /// The question is short, says what stays, and exists in every language.
@@ -2428,7 +2486,7 @@ mod tests {
     fn cancelling_the_restore_question_changes_nothing() {
         let mut h = changed_3d_mouse_settings(Some("hid 046d:c62b"));
         let before = h.app.preferences.clone();
-        scroll_to_and_click(&mut h, "dialog:button::Restore 3D Mouse Defaults");
+        scroll_to_and_click(&mut h, "dialog:button::Restore defaults");
         assert!(h.app.space_mouse.restore_pending, "the first click only asks");
         assert_eq!(h.app.preferences, before, "asking changes nothing");
         scroll_to_and_click(&mut h, "dialog:button::Cancel");
@@ -2442,8 +2500,8 @@ mod tests {
     fn restoring_with_no_device_works_and_a_later_connection_brings_nothing_back() {
         let mut h = changed_3d_mouse_settings(None);
         let calibrations = h.app.preferences.space_mouse_calibrations.clone();
-        scroll_to_and_click(&mut h, "dialog:button::Restore 3D Mouse Defaults");
-        scroll_to_and_click(&mut h, "dialog:button::Restore 3D Mouse Defaults");
+        scroll_to_and_click(&mut h, "dialog:button::Restore defaults");
+        scroll_to_and_click(&mut h, "dialog:button::Restore defaults");
         assert!(!h.app.space_mouse.restore_pending);
         let d = Prefs::default();
         let restored = |h: &crate::scenario::Harness| {
@@ -2474,7 +2532,7 @@ mod tests {
     fn closing_preferences_with_the_restore_question_up_does_not_leave_it_armed() {
         let mut h = changed_3d_mouse_settings(Some("hid 046d:c62b"));
         let before = h.app.preferences.clone();
-        scroll_to_and_click(&mut h, "dialog:button::Restore 3D Mouse Defaults");
+        scroll_to_and_click(&mut h, "dialog:button::Restore defaults");
         assert!(h.app.space_mouse.restore_pending);
         h.step(&serde_json::json!({"click": {"handle": "dialog:cancel"}})).unwrap();
         h.frames(6);
@@ -2492,8 +2550,8 @@ mod tests {
         let mut h = changed_3d_mouse_settings(Some("hid 046d:c62b"));
         let calibrations = h.app.preferences.space_mouse_calibrations.clone();
         assert!(!section_is_at_defaults(&h.app));
-        scroll_to_and_click(&mut h, "dialog:button::Restore 3D Mouse Defaults");
-        scroll_to_and_click(&mut h, "dialog:button::Restore 3D Mouse Defaults");
+        scroll_to_and_click(&mut h, "dialog:button::Restore defaults");
+        scroll_to_and_click(&mut h, "dialog:button::Restore defaults");
         assert!(!h.app.space_mouse.restore_pending && section_is_at_defaults(&h.app));
         let saved = h.app.prefs();
         let mut next = crate::scenario::Harness::new();
@@ -2531,7 +2589,7 @@ mod tests {
         prefs.frames(6);
         prefs.frames(30);
         assert!(prefs.app.space_mouse.calibrating.is_none());
-        scroll_to_and_click(&mut prefs, "dialog:button:3D mouse calibration:Calibrate…");
+        scroll_to_and_click(&mut prefs, "dialog:button:Calibration:Calibrate…");
         assert!(card.app.prefs_window.open && prefs.app.prefs_window.open);
         assert!(wizard(&card).is_some(), "the card's button started it");
         assert_eq!(wizard(&card), wizard(&prefs), "and Preferences' starts the same one");
@@ -2568,6 +2626,7 @@ mod tests {
             crate::prefs::open_at(&mut h.app, crate::prefs::PAGE_NAVIGATION);
             h.frames(6);
             h.frames(30);
+            open_advanced(&mut h);
             let up = h.widget(&note).is_some();
             assert_eq!(up, shown, "{driver:?} reading {device}, device present {direct}");
             // Whatever it says, no calibration moves between keys.
@@ -2576,7 +2635,7 @@ mod tests {
     }
 
     /// The section's buttons keep inside the page in every language, at the dialog's width (which the
-    /// window does not narrow): the arming Restore button, Reset axis assignment, Reset View under the
+    /// window does not narrow): the arming Restore button, Reset axis assignment, Reset view under the
     /// test model, and the buttons' own reset.
     #[test]
     fn the_3d_mouse_buttons_fit_the_page_in_every_language() {
@@ -2604,6 +2663,8 @@ mod tests {
             h.call("ui.resize", serde_json::json!({"width": 1600, "height": 4000}));
             crate::prefs::open_at(&mut h.app, crate::prefs::PAGE_NAVIGATION);
             h.frames(6);
+            scroll_to_and_click(&mut h, &format!("dialog:section:{}", crate::i18n::Locale::for_language(catalog.id).text("Advanced")));
+            h.frames(10);
             // The restore question is up, so its whole text can be checked too.
             h.app.space_mouse.restore_pending = true;
             // The frame's language is only set while it runs, so the texts come from the catalog itself.
@@ -2735,7 +2796,7 @@ mod tests {
     #[test]
     fn a_visible_line_says_what_the_3d_mouse_waits_for() {
         assert_eq!(crate::i18n::tr("ui.3d_mouse_waiting"), "Waiting for Movement");
-        assert_eq!(crate::i18n::tr("ui.3d_mouse_reset_view"), "Reset View");
+        assert_eq!(crate::i18n::tr("ui.3d_mouse_reset_view"), "Reset view");
         let mut h = crate::scenario::Harness::new();
         h.app.home.open = false;
         h.app.space_mouse.device = None;
@@ -2748,7 +2809,7 @@ mod tests {
         assert!(crate::scenario::rect_of("dialog:hint:space_mouse_wiggle").is_some());
     }
 
-    /// The boat's Reset View puts the boat back and nothing else: calibration, sensitivity, axis
+    /// The boat's Reset view puts the boat back and nothing else: calibration, sensitivity, axis
     /// assignment and the document's camera stay. Clicked as a person would.
     #[test]
     fn reset_view_is_scoped_to_the_test_model() {
@@ -2759,7 +2820,7 @@ mod tests {
         boat.cam.yaw += 1.0;
         h.app.space_mouse.boat = Some(boat);
         let before = (h.app.cam, h.app.preferences.clone());
-        scroll_to_and_click(&mut h, "dialog:button::Reset View");
+        scroll_to_and_click(&mut h, "dialog:button::Reset view");
         assert!(
             h.app.space_mouse.boat.is_none()
                 || h.app.space_mouse.boat.as_ref().is_some_and(|boat| boat.cam.yaw == crate::test_boat::Boat::new(30.0).cam.yaw),
@@ -2767,7 +2828,7 @@ mod tests {
         );
         assert_eq!(h.app.cam, before.0, "the document's camera");
         assert_eq!(h.app.preferences, before.1, "every setting, calibration included");
-        assert_eq!(crate::i18n::tr("ui.3d_mouse_reset_view"), "Reset View");
+        assert_eq!(crate::i18n::tr("ui.3d_mouse_reset_view"), "Reset view");
     }
 
     /// The "wiggle it" hint exists in every catalog and is a visible line while no device is confirmed,
