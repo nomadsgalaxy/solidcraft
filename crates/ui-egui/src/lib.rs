@@ -157,6 +157,7 @@ mod file_picker;
 pub(crate) mod frame_watch;
 #[cfg(test)]
 mod history_off_thread_tests;
+mod move_preview;
 pub use file_picker::FilePickerFuture;
 #[cfg(test)]
 mod blend_arrow_tests;
@@ -288,9 +289,7 @@ pub struct UiState {
     pub show_browser: bool,
     pub show_timeline: bool,
     pub show_grid: bool,
-    pub show_origin: bool,
     pub perspective: bool,
-    pub show_sketches: bool,
     pub palette_open: bool,
     /// Dark theme (the default); a preference kept between runs.
     pub dark: bool,
@@ -304,12 +303,6 @@ pub struct UiState {
     pub ground_shadow: bool,
     /// The world's up axis (Z or Y; #3): the camera, axis view, home view and ground follow it.
     pub up_axis: solidcraft_engine::render::UpAxis,
-    /// Sketches whose closed profiles are not shaded.
-    pub hidden_profiles: Vec<u64>,
-    /// Finished sketches whose dimensions are shown.
-    pub shown_dims: Vec<u64>,
-    /// Bodies locked in the browser (no move or delete).
-    pub locked_bodies: Vec<String>,
     /// The agent cursor: shown, speed, follow camera (#35).
     pub agent_cursor: agent_cursor::Settings,
 }
@@ -324,9 +317,7 @@ impl Default for UiState {
             show_browser: true,
             show_timeline: true,
             show_grid: true,
-            show_origin: true,
             perspective: false,
-            show_sketches: true,
             palette_open: false,
             dark: true,
             pick_off: Vec::new(),
@@ -334,9 +325,6 @@ impl Default for UiState {
             visual_style: 0,
             ground_shadow: true,
             up_axis: Default::default(),
-            hidden_profiles: Vec::new(),
-            shown_dims: Vec::new(),
-            locked_bodies: Vec::new(),
             agent_cursor: Default::default(),
         }
     }
@@ -843,6 +831,20 @@ impl SolveApp {
                 self.preferences.layout = layout;
                 self.ui.layout = layout;
             }
+            if matches!(id, "browser.expand_all" | "browser.collapse_all") {
+                let strings = |key: &str| -> Vec<String> {
+                    v.get(key)
+                        .and_then(Value::as_array)
+                        .map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_string)).take(10_000).collect())
+                        .unwrap_or_default()
+                };
+                browser::apply_fold(
+                    self,
+                    v.get("open").and_then(Value::as_bool).unwrap_or(id == "browser.expand_all"),
+                    &strings("open_by_default"),
+                    &strings("closed_by_default"),
+                );
+            }
             if id == "view.history_layout" {
                 if let Some(width) = v.get("width").and_then(Value::as_f64) {
                     self.preferences.timeline_left_width = ui_kit::history_snap_width(width as f32);
@@ -880,14 +882,6 @@ impl SolveApp {
             }
             // Curves drawn in construction (or centerline) mode take that line type.
             sketch_palette::apply_mode(self, id, v);
-            // Locks follow a body's rename, from the rename box or anywhere else.
-            if id == "body.rename"
-                && let (Some(old), Some(new)) = (v.get("body").and_then(Value::as_str), v.get("name").and_then(Value::as_str))
-            {
-                for b in self.ui.locked_bodies.iter_mut().filter(|b| *b == old) {
-                    *b = new.to_string();
-                }
-            }
         }
         self.finish_command(id, &r);
         r
@@ -964,6 +958,16 @@ impl SolveApp {
         }
         // A file is loading: the design waits for it.
         if self.file_load.busy() || self.file_picker.is_some() {
+            return;
+        }
+        // Front … Isometric (Ctrl+1…7 by default) turn the view as the view cube's faces do. The
+        // flat pattern is a 2D page: it has no other side to turn to.
+        if solidcraft_engine::standard_view(id).is_some() {
+            if !dialogs_sheet::flat_active(self) {
+                // `view.isometric` → "isometric", which `StandardView::parse` reads as Iso.
+                self.animate_view(id.trim_start_matches("view."));
+                self.home.open = false;
+            }
             return;
         }
         if id == "view.normal_to" {
@@ -1098,10 +1102,29 @@ impl SolveApp {
             self.cancel_sketch();
             return;
         }
-        // Press Pull: edges get a fillet, faces and profiles an extrude.
+        // Press Pull: edges get a fillet, curved faces an offset, planar faces and profiles an extrude.
         if id == "solid.press_pull" {
-            let edges = self.session.selection.iter().any(|s| matches!(s, solidcraft_engine::Sel::Edge { .. }));
-            return self.start(if edges { "solid.fillet" } else { "solid.extrude" });
+            let sel = &self.session.selection;
+            let edges = sel.iter().any(|s| matches!(s, solidcraft_engine::Sel::Edge { .. }));
+            let curved = sel.iter().any(
+                |s| matches!(s, solidcraft_engine::Sel::Face { body, index, .. } if dialogs::planar_face(&self.session, body, *index).is_none()),
+            );
+            if edges {
+                return self.start("solid.fillet");
+            }
+            if curved {
+                return self.start("solid.offset_face");
+            }
+            let empty = sel.is_empty();
+            self.start("solid.extrude");
+            if empty
+                && let Some(d) = &mut self.dialog
+                && let Some(input) = d.inputs.first_mut()
+            {
+                input.accept |= selection::FACES | selection::EDGES;
+                d.press_pull = true;
+            }
+            return;
         }
         if let Some(spec) = solidcraft_engine::find_command(id)
             && (tools::Tool::for_command(id).is_some() || dialogs::Dialog::for_command(self, id).is_some())
@@ -1286,11 +1309,22 @@ impl SolveApp {
         v
     }
 
+    /// Is the browser's Origin folder shown? The design keeps it once it is toggled; until then
+    /// the Hide Origin by Default preference decides.
+    pub fn origin_shown(&self) -> bool {
+        !self.session.visibility.origin_hidden.unwrap_or(self.preferences.hide_origin)
+    }
+
+    /// Show or hide the browser's Origin folder (saved with the design).
+    pub fn set_origin_shown(&mut self, on: bool) {
+        self.session.visibility.origin_hidden = Some(!on);
+    }
+
     /// Is the origin widget shown? Origin planes and axes are drawn and pickable. While a dialog
     /// picks a plane ([`SolveApp::picking_plane`]) the Origin is always shown, drawn through the
     /// model (a plane inside a body stays visible), even when the browser hides it.
     pub fn origin_visible(&self) -> bool {
-        self.ui.show_origin || self.picking_plane()
+        self.origin_shown() || self.picking_plane()
     }
 
     /// Is Create Sketch open, waiting for its plane?

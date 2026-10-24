@@ -59,7 +59,7 @@ fn empty_space_offers_view_items_and_greys_out_undo() {
     assert!(!context_menu::radial_items(&app)[0].enabled, "no command to repeat yet");
     // Hide Origin toggles.
     context_menu::run_item(&mut app, &find(&items, "Hide Origin"), pos2(0.0, 0.0));
-    assert!(!app.ui.show_origin);
+    assert!(!app.origin_shown());
 }
 
 #[test]
@@ -240,7 +240,7 @@ fn sketch_menu_hides_and_moves_to_another_plane() {
     context_menu::run_item(&mut app, &find(&items, "Show/Hide"), pos2(0.0, 0.0));
     assert_eq!(crate::browser::sketch_visible(&app, id), !vis);
     context_menu::run_item(&mut app, &find(&items, "Show Dimension"), pos2(0.0, 0.0));
-    assert_eq!(app.ui.shown_dims, vec![id]);
+    assert_eq!(app.session.visibility.shown_dimensions, vec![id]);
     assert!(find(&context_menu::items(&app, &t), "Hide Dimension").enabled);
     context_menu::run_item(&mut app, &find(&items, "Edit Sketch"), pos2(0.0, 0.0));
     assert_eq!(app.session.active_sketch, Some(id));
@@ -348,7 +348,7 @@ fn pick_runs_an_item_of_the_open_menu() {
     assert!(context_menu::pick(&mut app, "Undo").is_err(), "disabled");
     assert!(context_menu::pick(&mut app, "ui.origin").is_ok());
     assert!(app.viewport.context_menu.is_none(), "a pick closes the menu");
-    assert!(!app.ui.show_origin);
+    assert!(!app.origin_shown());
 }
 
 #[test]
@@ -390,6 +390,31 @@ fn browser_folds_are_kept_in_the_preferences() {
     let mut other = sample_app();
     other.load_prefs(&prefs);
     assert!(other.tree.collapsed.contains("c0/sketches") && other.tree.expanded.contains("origin"));
+}
+
+#[test]
+fn expand_and_collapse_all_open_the_browser_tree_from_the_design_menu() {
+    let mut app = sample_app();
+    let n = app.session.undo.len();
+    let root = Target::Component { id: 0 };
+    assert!(context_menu::items(&app, &root).iter().any(|i| i.label == "Expand All" && i.id == "browser.expand_all"));
+    act(&mut app, &root, "Collapse All");
+    assert!(app.tree.collapsed.contains("c0/bodies"), "{:?}", app.tree.collapsed);
+    assert!(!app.tree.collapsed.contains("c0"), "the design row stays open: {:?}", app.tree.collapsed);
+    assert_eq!(app.session.undo.len(), n);
+    act(&mut app, &root, "Expand All");
+    assert!(!app.tree.collapsed.contains("c0/bodies"), "{:?}", app.tree.collapsed);
+    assert!(app.tree.expanded.contains("origin") && app.tree.expanded.contains("c0/features"), "{:?}", app.tree.expanded);
+    assert_eq!(app.session.undo.len(), n);
+
+    let created = app.run("component.create", json!({"name": "Part"})).unwrap();
+    let occ = created["occurrence"].as_u64().unwrap();
+    let path = vec![occ];
+    act(&mut app, &Target::Occurrence { path: path.clone() }, "Collapse All");
+    assert!(app.tree.collapsed.contains(&format!("o:{occ}")), "{:?}", app.tree.collapsed);
+    assert!(!app.tree.collapsed.contains("c0/bodies"), "a placement's collapse leaves the rest of the tree: {:?}", app.tree.collapsed);
+    act(&mut app, &Target::Occurrence { path }, "Expand All");
+    assert!(!app.tree.collapsed.contains(&format!("o:{occ}")), "{:?}", app.tree.collapsed);
 }
 
 #[test]
@@ -746,6 +771,35 @@ fn f2_renames_the_selected_item() {
     assert!(app.session.model.state().body("Base").is_some());
     app.run("select.clear", json!({})).unwrap();
     assert!(!context_menu::rename_selection(&mut app, pos2(0.0, 0.0)), "nothing selected");
+}
+
+/// A double-click on a body's browser row edits its name in the row, like F2 (no floating box);
+/// Escape cancels, and a second double-click then commits a new name.
+#[test]
+fn double_click_on_a_body_row_renames_it_in_the_row() {
+    let mut h = crate::scenario::Harness::new();
+    h.app.run("solid.box", json!({"length": 40, "width": 40, "height": 10, "body_name": "Block"})).unwrap();
+    h.app.run("select.clear", json!({})).unwrap();
+    h.frames(3);
+    let at = crate::scenario::handle_at("row:Block").expect("the body has a browser row");
+    h.call("ui.click", json!({"x": at.x, "y": at.y, "double": true}));
+    h.frames(3);
+    let rename = h.app.menu.rename.as_ref().expect("a double-click starts the rename");
+    assert!(rename.inline, "the name is edited in its row");
+    assert!(matches!(&rename.what, context_menu::RenameWhat::Body(b) if b == "Block"));
+    assert!(crate::scenario::handle_at("rename:Block").is_some(), "the row shows its name editor");
+    // Escape leaves the name alone.
+    h.step(&json!({"key": "Escape"})).unwrap();
+    h.frames(2);
+    assert!(h.app.menu.rename.is_none());
+    assert!(h.app.session.model.state().body("Block").is_some());
+    // Past egui's double-click window, so this is a new double-click and not a triple.
+    h.frames(40);
+    let at = crate::scenario::handle_at("row:Block").expect("the row is still there");
+    h.call("ui.click", json!({"x": at.x, "y": at.y, "double": true}));
+    h.frames(3);
+    assert!(context_menu::finish_rename(&mut h.app, Some("Base"), true));
+    assert!(h.app.session.model.state().body("Base").is_some());
 }
 
 #[test]
@@ -1150,4 +1204,91 @@ fn narrow_overflow_submenu_keeps_opening_click_and_accepts_the_next_click() {
     assert!(crate::scenario::handle_at("toolbar:solid.extrude").is_some());
     h.step(&json!({"click":{"handle":"toolbar:solid.extrude"}})).unwrap();
     assert!(matches!(h.app.dialog.as_ref().map(|d| &d.kind), Some(crate::dialogs::Kind::Extrude { .. })));
+}
+
+/// A right-click on a browser row opens its menu, also when the press and the release reach the
+/// same frame (a trackpad tap, or a click during a slow frame).
+mod browser_rows {
+    use egui::{Event, Modifiers, PointerButton, Pos2, vec2};
+
+    use crate::context_menu::Target;
+    use crate::scenario::Harness;
+
+    fn harness() -> Harness {
+        let mut h = Harness::new();
+        h.app.home.open = false;
+        h.app.ui.show_browser = true;
+        h.app.session.run_script(&solidcraft_engine::sample::script()).expect("sample");
+        h.frames(3);
+        h
+    }
+
+    /// What a menu is about, without the browser's scope of a folder.
+    fn kind(t: &Target) -> String {
+        match t {
+            Target::Folder { folder, .. } => format!("folder:{folder}"),
+            Target::Body { name } => format!("body:{name}"),
+            other => format!("{other:?}"),
+        }
+    }
+
+    fn right(at: Pos2, pressed: bool) -> Event {
+        Event::PointerButton { pos: at, button: PointerButton::Secondary, pressed, modifiers: Modifiers::NONE }
+    }
+
+    fn right_click(h: &mut Harness, at: Pos2, one_frame: bool) {
+        h.frame_with(vec![Event::PointerMoved(at)]);
+        if one_frame {
+            h.frame_with(vec![right(at, true), right(at, false)]);
+        } else {
+            h.frame_with(vec![right(at, true)]);
+            h.frame_with(vec![right(at, false)]);
+        }
+        h.frames(4);
+    }
+
+    #[test]
+    fn a_right_click_on_a_row_opens_its_menu_however_its_events_arrive() {
+        let mut h = harness();
+        let rows = [("row:Origin", "Origin"), ("row:Bodies", "folder:bodies"), ("row:Plate", "body:Plate"), ("row:Sketches", "folder:sketches")];
+        for (row, target) in rows {
+            let Some(centre) = crate::scenario::handle_at(row) else { panic!("{row} is not drawn: {:?}", crate::scenario::handles("row:")) };
+            // Pointers sit between whole points (trackpads, HiDPI screens).
+            for offset in [vec2(0.0, 0.0), vec2(0.25, 0.75), vec2(0.5, 0.5), vec2(0.75, 0.25)] {
+                for one_frame in [false, true] {
+                    crate::context_menu::close(&mut h.app);
+                    h.frames(2);
+                    right_click(&mut h, centre + offset, one_frame);
+                    let how = if one_frame { "in one frame" } else { "in two frames" };
+                    assert!(h.app.viewport.context_menu.is_some(), "{row} at {offset:?}, press and release {how}: the menu did not stay open");
+                    assert_eq!(kind(&h.app.menu.target), target, "{row}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_click_elsewhere_moves_or_closes_an_open_menu() {
+        let mut h = harness();
+        let half = vec2(0.5, 0.5);
+        let plate = crate::scenario::handle_at("row:Plate").expect("Plate row");
+        let origin = crate::scenario::handle_at("row:Origin").expect("Origin row");
+        right_click(&mut h, plate + half, true);
+        assert!(h.app.viewport.context_menu.is_some());
+        assert_eq!(h.app.menu.target, Target::Body { name: "Plate".into() });
+        right_click(&mut h, origin + half, true);
+        assert!(h.app.viewport.context_menu.is_some(), "a right-click on another row opens that row's menu");
+        assert_eq!(h.app.menu.target, Target::Origin);
+
+        let empty = h.app.viewport.rect.expect("viewport").right_bottom() - vec2(80.5, 80.5);
+        right_click(&mut h, empty, true);
+        assert!(h.app.viewport.context_menu.is_some(), "the viewport's menu opens the same way");
+        assert_eq!(h.app.menu.target, Target::Viewport);
+
+        let primary = |pressed| Event::PointerButton { pos: origin, button: PointerButton::Primary, pressed, modifiers: Modifiers::NONE };
+        h.frame_with(vec![Event::PointerMoved(origin)]);
+        h.frame_with(vec![primary(true), primary(false)]);
+        h.frames(2);
+        assert!(h.app.viewport.context_menu.is_none(), "a click outside the menu closes it");
+    }
 }
