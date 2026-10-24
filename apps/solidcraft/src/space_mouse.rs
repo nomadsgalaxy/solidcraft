@@ -1588,6 +1588,7 @@ mod tests {
         };
         // A window that has run a frame with focus, as the app's always has by now.
         let ctx = Context::default();
+        // Clear the frame's texture changes, or dropping them panics in debug builds (as in #60).
         ctx.run_ui(egui::RawInput::default(), |_| {}).textures_delta.clear();
         mouse.tick_at(&mut app, &ctx, now);
         let DeviceMotion { motion, seconds } = app.viewport.device_motion.expect("the frame hands the page its motion");

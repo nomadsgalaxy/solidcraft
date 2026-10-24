@@ -285,6 +285,7 @@ fn window_page<const INDEX: usize>(ui: &mut egui::Ui, app: &mut SolveApp) {
         crate::scenario::publish_target("prefs:page:Selection", rect);
     }
     if app.prefs_window.section != INDEX {
+        crate::keymap::stop_capture(app);
         app.keymap.read_only = false;
         app.prefs_window.section = INDEX;
     }
@@ -512,6 +513,9 @@ preference_settings! {
     /// The grid turns to the upright origin plane facing a side view (#1470). Off by default: the
     /// grid stays on the ground plane (XY) whatever the view.
     grid_follows_view: bool = false => check("Grid follows the view", "Side views show the grid on the upright plane facing them instead of the ground");
+    /// Draw reference geometry such as inactive sketches and datum planes through shaded bodies.
+    /// Off by default to preserve the depth-tested viewport behaviour.
+    reference_geometry_through_bodies: bool = false, PAGE_GRAPHICS => check_id("settings.reference_geometry_through_bodies");
     /// How finely the viewport tessellates curved faces and edges: `coarse`, `normal`, `fine` or
     /// `ultra` (#1287). Only the display plan the viewport draws; never the design or exports.
     display_quality: String = "normal".into(), PAGE_GRAPHICS;
@@ -574,6 +578,9 @@ preference_settings! {
     up_axis: String = "z".into(), PAGE_DESIGN;
     /// After a STEP or IGES file opens, offer to stand a Y-up part up (`stand_up`).
     offer_stand_up: bool = true, PAGE_DESIGN => check("Offer to stand up Y-up files", "After a STEP or IGES file opens with Z up, offer a quarter turn about X");
+    /// Extrude: with a profile picked, a face, vertex or parallel plane picked off its plane
+    /// switches the extent to To Object (off: picks only add profiles, as before).
+    extrude_auto_to_object: bool = false, PAGE_DESIGN => check("Extrude to a picked target", "In Extrude, with a profile picked, picking a face, vertex or parallel plane off its plane switches the extent to To Object");
     /// What a middle-button double-click in the view does: `home`, `fit` or `off`.
     middle_double_click: String = "home".into(), PAGE_NAVIGATION;
     /// Colour vision mode (#778): `off`, `protan`, `deutan` or `tritan`.
@@ -604,6 +611,9 @@ preference_settings! {
     /// so the window stays live while they run (#1989, [`crate::control_job`]). Off: they run on
     /// the window thread, and the window waits for each, as before (the default).
     agent_off_thread: bool = false, PAGE_AI;
+    /// Let AI agents connect: the localhost control channel (MCP) opens on the default port at
+    /// start-up, unless `--control`/`SOLIDCRAFT_CONTROL_PORT` name one. Read at start-up.
+    agent_control: bool = true, PAGE_AI;
     /// Agents the user added (the installed ones are found by themselves). API keys are never
     /// here: they live in the system keychain.
     agents: Vec<crate::agent_chat::agents::AgentConfig> = Vec::new();
@@ -1253,7 +1263,7 @@ pub fn show(app: &mut SolveApp, ctx: &egui::Context) {
 }
 
 /// Close the dialog; `revert`: put back what was there when it opened (Cancel, Esc, ×).
-fn close(app: &mut SolveApp, revert: bool) {
+pub(crate) fn close(app: &mut SolveApp, revert: bool) {
     if let Some(s) = app.prefs_window.snapshot.take()
         && revert
     {
@@ -2085,6 +2095,11 @@ pub fn set(app: &mut SolveApp, p: &serde_json::Value) -> Result<serde_json::Valu
     }
     if new.custom_themes.len() > crate::theme_files::MAX_CUSTOM || new.custom_themes.iter().any(|t| t.colors.len() > crate::theme_files::MAX_COLORS) {
         return Err(format!("at most {} imported themes of {} colours each", crate::theme_files::MAX_CUSTOM, crate::theme_files::MAX_COLORS));
+    }
+    for theme in &new.custom_themes {
+        theme.validate_radii()?;
+        crate::theme_files::parse_icon_palette(&theme.icon_palette)?;
+        crate::theme_files::parse_borders(&theme.borders)?;
     }
     if !crate::i18n::is_supported(&new.language) {
         return Err(format!("`language` must be one of: {}", crate::i18n::LOCALES.iter().map(|locale| locale.id).collect::<Vec<_>>().join(", ")));
@@ -3101,6 +3116,22 @@ mod tests {
     }
 
     #[test]
+    fn changing_preferences_page_cancels_shortcut_capture() {
+        let mut h = crate::scenario::Harness::new();
+        h.app.home.open = false;
+        h.call("ui.prefs", json!({"open":"Keyboard Shortcuts"}));
+        h.step(&json!({"click":{"handle":"keymap:filter"}})).unwrap();
+        h.step(&json!({"text":"solid.extrude"})).unwrap();
+        h.step(&json!({"click":{"handle":"keymap:capture:solid.extrude"}})).unwrap();
+        h.step(&json!({"key":"M","pressed":true})).unwrap();
+        h.step(&json!({"click":{"handle":"prefs:page:General"}})).unwrap();
+        assert!(!crate::keymap::capturing(&h.app));
+        assert_eq!(crate::keymap::effective(&h.app, "solid.extrude").as_deref(), Some("E"));
+        h.frames(65);
+        assert_eq!(crate::keymap::effective(&h.app, "solid.extrude").as_deref(), Some("E"));
+    }
+
+    #[test]
     fn display_quality_cards_show_increasing_facet_detail() {
         let mut app = super::SolveApp::new(Default::default(), Default::default());
         super::open_at(&mut app, super::PAGE_GRAPHICS);
@@ -3244,16 +3275,26 @@ mod tests {
             solidcraft_engine::render::Rgb(hard.viewport_top.r(), hard.viewport_top.g(), hard.viewport_top.b())
         );
 
-        let file = json!({"format": "solidcraft-theme/1", "name": "Paper", "base": "light", "colors": {"panel": "#fffdf0", "accent": "#aa3300"}});
+        let file = json!({"format": "solidcraft-theme/1", "name": "Paper", "base": "light", "colors": {"panel": "#fffdf0", "accent": "#aa3300"}, "borders":{"primary":{"width":2,"color":"#ffffff"},"tertiary":{"width":0,"color":"#000000"}}, "radii": {"radius_sm": 0, "control_radius": 0, "radius_xl": 16}});
         let out = h.call("ui.prefs", json!({"theme_import": file, "theme_export": true}));
         assert_eq!(out["result"]["theme_imported"], "paper", "{out}");
         assert_eq!((out["result"]["theme"].as_str(), out["result"]["dark"].as_bool()), (Some("paper"), Some(false)));
         let exported = &out["result"]["theme_file"];
         assert_eq!((exported["name"].as_str(), exported["base"].as_str()), (Some("Paper"), Some("light")));
         assert_eq!(exported["colors"]["panel"], "#fffdf0");
+        assert_eq!(exported["radii"]["control_radius"], 0);
+        assert_eq!(exported["radii"]["radius_xl"], 16);
+        assert_eq!(exported["radii"]["radius_md"], 6);
+        assert_eq!(exported["borders"]["primary"]["width"], 2.0);
         assert_eq!(exported["colors"]["text"].as_str().map(str::len), Some(7), "an export is complete: {exported}");
         h.frames(2);
         assert_eq!((Tokens::get().panel, Tokens::get().text), (egui::Color32::from_rgb(0xff, 0xfd, 0xf0), Tokens::light().text));
+        assert_eq!((Tokens::get().control_radius, Tokens::get().radius_xl), (0, 16));
+        let invalid = h.call(
+            "ui.prefs",
+            json!({"theme_import": {"format": "solidcraft-theme/1", "name": "Bad", "base": "dark", "radii": {"control_radius": -1}}}),
+        );
+        assert!(invalid["error"].as_str().is_some_and(|e| e.contains("radii.control_radius")));
         let out = h.call(
             "ui.prefs",
             json!({"theme_import": "{\"format\":\"solidcraft-theme/1\",\"name\":\"x\",\"base\":\"dark\",\"colors\":{\"nope\":\"#000000\"}}"}),
@@ -3265,6 +3306,8 @@ mod tests {
         let mut other = crate::SolveApp::new(solidcraft_engine::Session::default(), crate::Services::default());
         other.load_prefs(&h.app.prefs());
         assert_eq!((other.preferences.theme.as_str(), other.preferences.custom_themes.len()), ("paper", 1));
+        assert_eq!(other.preferences.custom_themes[0].radii, h.app.preferences.custom_themes[0].radii);
+        assert_eq!(other.preferences.custom_themes[0].borders, h.app.preferences.custom_themes[0].borders);
 
         let out = h.call("ui.prefs", json!({"theme_remove": "paper"}));
         assert_eq!((out["result"]["theme"].as_str(), out["result"]["dark"].as_bool()), (Some("light"), Some(false)), "{out}");
@@ -3279,6 +3322,7 @@ mod tests {
         assert!(h.app.preferences.custom_themes.is_empty(), "Cancel takes the import back");
         h.frames(2);
         assert_eq!(Tokens::get().panel, Tokens::dark().panel);
+        assert_eq!((Tokens::get().control_radius, Tokens::get().radius_xl), (6, 10));
     }
 
     /// Picking a font closes the font list, not the Preferences window's body: that folded the
@@ -3441,6 +3485,19 @@ mod tests {
         assert!(set(&mut app, &serde_json::json!({ "msaa": 1 })).is_ok());
         app.load_prefs(&serde_json::json!({ "preferences": { "msaa": 16 } }).to_string());
         assert_eq!(app.preferences.msaa, Prefs::default().msaa);
+    }
+
+    /// "Let AI agents connect" is on for a new install and for preferences saved before it existed;
+    /// an explicit off stays off.
+    #[test]
+    fn agent_control_is_on_unless_saved_off() {
+        assert!(Prefs::default().agent_control);
+        let mut app = SolveApp::new(solidcraft_engine::Session::default(), crate::Services::default());
+        app.preferences.agent_control = false;
+        app.load_prefs(&serde_json::json!({ "preferences": { "msaa": 4 } }).to_string());
+        assert!(app.preferences.agent_control);
+        app.load_prefs(&serde_json::json!({ "preferences": { "agent_control": false } }).to_string());
+        assert!(!app.preferences.agent_control);
     }
 
     #[test]

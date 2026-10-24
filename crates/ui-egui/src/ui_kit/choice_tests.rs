@@ -83,3 +83,47 @@ fn segments_stay_segments_when_a_scrollbar_appears_and_disappears() {
     assert!(!form(&ctx, strict - 3.0 * scrollbar) && !form(&ctx, strict - 3.0 * scrollbar), "far too narrow: the dropdown");
     assert!(form(&ctx, strict + scrollbar + 3.0), "wide again: segments");
 }
+
+#[test]
+fn beveled_segments_share_fill_corners_at_internal_joins() {
+    use crate::theme::Tokens;
+    use egui::{Color32, Shape};
+    let mut t = Tokens::light();
+    t.control_radius = 8;
+    t.borders.bevel = Some(crate::theme::Bevel {
+        width: 0.5,
+        highlight: Color32::WHITE,
+        light: Color32::LIGHT_GRAY,
+        shadow: Color32::GRAY,
+        dark_shadow: Color32::BLACK,
+    });
+    let _restore = crate::theme::scoped_tokens(t);
+    for selected in 0..3 {
+        let ctx = crate::fonts::test_context();
+        let mut selected = selected;
+        let output = crate::test_support::frame(&ctx, egui::RawInput::default(), |ui| {
+            ui.set_width(300.0);
+            segmented(ui, &mut selected, &["Left", "Middle", "Right"], Default::default());
+        });
+        let fill = output
+            .shapes
+            .iter()
+            .find_map(|s| match &s.shape {
+                Shape::Rect(r) if r.fill == t.selected_bg => Some(r),
+                _ => None,
+            })
+            .expect("selected segment fill");
+        for edge in [fill.rect.left(), fill.rect.right()] {
+            let internal = if edge == fill.rect.left() { selected > 0 } else { selected < 2 };
+            if internal {
+                // A rounded bevel used to curve away while selection filled the square
+                // internal corner. Its top band must now reach the segment join.
+                assert!(output.shapes.iter().any(|s| match &s.shape {
+                    Shape::LineSegment { points, .. } =>
+                        points.iter().any(|p| (p.y - fill.rect.top() - 0.25).abs() < 0.01 && (p.x - edge).abs() <= 0.26),
+                    _ => false,
+                }));
+            }
+        }
+    }
+}
