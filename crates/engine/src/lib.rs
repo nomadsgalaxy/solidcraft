@@ -10,6 +10,7 @@
 pub mod capture;
 pub mod cmd;
 pub mod control_auth;
+pub mod control_pending;
 pub mod crash;
 pub mod easyprint;
 pub mod frames;
@@ -141,7 +142,7 @@ pub enum Sel {
     Plane {
         name: String,
     },
-    /// An origin axis (X, Y, Z).
+    /// An origin axis (X, Y, Z) or a construction axis (by feature name).
     Axis {
         name: String,
     },
@@ -167,6 +168,16 @@ pub struct Snapshot {
     pub doc: Arc<Document>,
     pub active_sketch: Option<u64>,
     pub pending_moves: std::collections::BTreeMap<u64, solidcraft_doc::Mat>,
+}
+
+/// Where the open sketch was entered (`sketch.create`, `sketch.edit`): the design before it and
+/// the undo history then, so `sketch.cancel` can tell the entry still describes the history.
+#[derive(Clone)]
+pub(crate) struct SketchEntry {
+    pub(crate) sketch: u64,
+    pub(crate) doc: Arc<Document>,
+    pub(crate) undo_len: usize,
+    pub(crate) undo_top: Option<Arc<Document>>,
 }
 
 /// A copy of a session that evaluates commands ahead of it ([`Session::ahead`]).
@@ -253,6 +264,8 @@ pub struct Session {
     pub redo: Vec<Snapshot>,
     /// Sketch feature being edited (sketch mode).
     pub active_sketch: Option<u64>,
+    /// The design as it was when the open sketch was entered, for Cancel Sketch.
+    pub(crate) sketch_entry: Option<SketchEntry>,
     pub selection: Vec<Sel>,
     pub path: Option<String>,
     /// Tells this document from every other one opened or started in this process: new for each
@@ -436,6 +449,7 @@ impl Session {
             undo: Vec::new(),
             redo: Vec::new(),
             active_sketch: None,
+            sketch_entry: None,
             selection: Vec::new(),
             path: None,
             uid: NEXT_UID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
@@ -514,10 +528,16 @@ impl Session {
         }
         if let Some(executor) = &self.render_jobs.descriptor {
             let mut executor = executor.clone();
-            if self.render_jobs.host.as_ref().is_none_or(|host| !host.is_available()) {
-                executor.availability = render::Availability::Unavailable { reason: "CPU image host is unavailable".into() };
-            }
+            executor.availability = image_host_availability(self.render_jobs.host.as_ref(), &executor.id);
             backend.executors.push(executor);
+        }
+        if let Some(raytrace) = render_jobs::cpu_raytrace_descriptor(self.render_jobs.host.as_ref()) {
+            backend.executors.push(raytrace);
+        }
+        for (host, descriptor) in &self.render_jobs.additional {
+            let mut descriptor = descriptor.clone();
+            descriptor.availability = image_host_availability(Some(host), &descriptor.id);
+            backend.executors.push(descriptor);
         }
         backend
     }
@@ -532,6 +552,9 @@ impl Session {
             return Ok(());
         }
         if let Some(executor) = &viewport {
+            if executor.id.as_str() == "cpu-raytrace" {
+                return Err(EngineError::Other("cpu-raytrace is reserved for the native CPU raytrace integrator".into()));
+            }
             if executor.profiles.is_empty() || executor.profiles.iter().any(|p| p.operation != render::RenderOperation::Viewport) {
                 return Err(EngineError::Other("host viewport executor must contain only viewport profiles".into()));
             }
@@ -539,6 +562,10 @@ impl Session {
             if let Some(executor) = &self.render_jobs.descriptor {
                 backend.executors.push(executor.clone());
             }
+            if let Some(raytrace) = render_jobs::cpu_raytrace_descriptor(self.render_jobs.host.as_ref()) {
+                backend.executors.push(raytrace);
+            }
+            backend.executors.extend(self.render_jobs.additional.iter().map(|(_, d)| d.clone()));
             backend.executors.push(executor.clone());
             // Resolution validates the whole registry, including duplicate executor IDs.
             let request = render::RenderRequest {
@@ -693,6 +720,7 @@ impl Session {
     /// which keeps every result and mesh (#3044).
     fn refresh_from(&mut self, previous: &Arc<Document>) {
         self.follow_plane_renames(previous);
+        self.follow_axis_point_renames(previous);
         if let Some((old, new)) = self.body_rename(previous)
             && self.model.rename_body(&self.doc, &old, &new)
         {
@@ -857,6 +885,7 @@ impl Session {
         let spec = find_command(id).ok_or_else(|| EngineError::UnknownCommand(id.to_string()))?;
         let host_viewport = self.render_viewport.clone();
         let host_jobs = self.render_jobs.host.clone();
+        let additional_jobs = self.render_jobs.additional.clone();
         let live = spec.live.filter(|_| params.get("live").and_then(Value::as_bool) == Some(true));
         if live.is_none() && spec.reads_model && self.model.is_stale() {
             self.refresh();
@@ -868,6 +897,8 @@ impl Session {
             active_sketch: self.active_sketch,
             pending_moves: self.pending_moves.clone(),
         };
+        // Where new geometry goes: not in the design, but a replay needs it (component.activate).
+        let active_before = (self.active_component, self.active_occurrence_path.clone());
         let null = Value::Object(Default::default());
         let params = if params.is_null() { &null } else { params };
         let given = params;
@@ -898,6 +929,9 @@ impl Session {
         if self.render_jobs.host.is_none() && host_jobs.is_some() {
             self.set_render_job_host(host_jobs)?;
         }
+        for (host, _) in additional_jobs {
+            self.register_render_job_host(host)?;
+        }
         if outermost && crash::enabled() {
             // A failed command leaves the design as it was (restored below).
             let failed = r.as_ref().err().map(ToString::to_string);
@@ -906,6 +940,8 @@ impl Session {
             let changed = !Arc::ptr_eq(&self.doc, &before.doc)
                 || self.active_sketch != before.active_sketch
                 || self.pending_moves != before.pending_moves
+                || self.active_component != active_before.0
+                || self.active_occurrence_path != active_before.1
                 || spec.id.starts_with("select.");
             crash::command_done(self.crash_journal, changed, &before.doc, after, spec.id, given, failed.map_or(Ok(()), Err));
         }
@@ -1019,6 +1055,7 @@ impl Session {
             undo: Vec::new(),
             redo: Vec::new(),
             active_sketch: self.active_sketch,
+            sketch_entry: None,
             selection: self.selection.clone(),
             path: None,
             uid: self.uid,
@@ -1253,6 +1290,8 @@ mod hole_face_tests;
 #[cfg(test)]
 mod hole_matrix_tests;
 #[cfg(test)]
+mod hole_reference_tests;
+#[cfg(test)]
 mod large_assembly_tests;
 #[cfg(test)]
 mod measure_centre_tests;
@@ -1295,4 +1334,14 @@ fn own_values(sk: &solidcraft_sketch::Sketch) -> std::collections::BTreeMap<Stri
         }
     }
     values
+}
+
+/// Capabilities are fixed at registration; availability is live device/host state.
+fn image_host_availability(host: Option<&render::job::ImageHost>, expected: &render::ExecutorId) -> render::Availability {
+    match host.map(render::job::ImageHost::descriptor) {
+        Some(Ok(current)) if current.id == *expected => current.availability,
+        Some(Ok(_)) => render::Availability::Unavailable { reason: "image executor identity changed after registration".into() },
+        Some(Err(error)) => render::Availability::Unavailable { reason: format!("image executor status unavailable: {error}") },
+        None => render::Availability::Unavailable { reason: "image host is unavailable".into() },
+    }
 }
