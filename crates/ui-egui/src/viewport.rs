@@ -767,7 +767,7 @@ impl BodyDraw {
         }
         let at = |p: Vec3| self.place.as_ref().map_or(p, |m| solidcraft_engine::doc::apply_point(m, p)).to_f32();
         for (ei, e) in m.edges.iter().enumerate().filter(|_| edges) {
-            if !m.edge_pickable(ei) || (shaded && !m.shaded_edge_visible(ei)) {
+            if !m.edge_visible(ei) || (shaded && !m.shaded_edge_visible(ei)) {
                 continue;
             }
             for w in e.windows(2) {
@@ -5241,6 +5241,68 @@ mod tests {
         assert!(w < 5120 && w as f32 >= 2560.0 * 1.25 && u64::from(w) * u64::from(h) * 32 <= 384 << 20, "{w} x {h}");
     }
 
+    /// Ambient occlusion beside a block on a plate (#4167, #3407), seen from above with a radius
+    /// large on screen (a big design seen close up): the plate darkens toward the block and is
+    /// clear beyond the radius, with no copies of the block's outline in the darkening. The same
+    /// sample offsets at every pixel gave each sample its own shifted copy, so beside the block's
+    /// straight side every row was the same staircase. Skipped without a GPU adapter.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn ambient_occlusion_draws_no_copies_of_a_part() {
+        let mut s = solidcraft_engine::Session::default();
+        s.execute("solid.box", &json!({"length": 300, "width": 300, "height": 4, "corner": [-150, -150, -4], "body_name": "plate"})).unwrap();
+        s.execute("solid.box", &json!({"length": 30, "width": 160, "height": 16, "corner": [0, -80, 0], "operation": "new", "body_name": "block"}))
+            .unwrap();
+        let mut app = SolveApp::new(s, crate::Services::default());
+        let (yaw, pitch) = solidcraft_engine::render::StandardView::Top.angles();
+        app.cam = Camera { target: Vec3::new(-30.0, 0.0, 0.0), yaw, pitch, roll: 0.0, distance: 200.0, fov: 0.0, ..Default::default() };
+        app.ui.perspective = false;
+        app.ui.show_grid = false;
+        app.set_origin_shown(false);
+        app.ui.ground_shadow = false;
+        app.viewport.gpu = Some(GpuTarget { format: egui_wgpu::wgpu::TextureFormat::Rgba8Unorm, depth: None, samples: 1, tess: false });
+        const SIZE: u32 = 512;
+        const RADIUS: f32 = 45.0;
+        let rect = Rect::from_min_size(Pos2::ZERO, vec2(SIZE as f32, SIZE as f32));
+        let proj = projection(&app, rect);
+        let e = proj.cam.eye().to_f32();
+        let eye = [e[0], e[1], e[2], 0.0];
+        let render =
+            |radius: f32| crate::gpu::render_offscreen_ao(build_scene(&app).merged(), proj.vp.to_f32(), proj.cam.back().to_f32(), eye, SIZE, radius);
+        let (Some(off), Some(on)) = (render(0.0), render(RADIUS)) else {
+            eprintln!("skipping: no GPU adapter");
+            return;
+        };
+        let (w, r) = (f64::from(SIZE), scene_radius(&app));
+        let at = |p: Vec3| proj.cam.to_screen(p, w, w, r).unwrap();
+        // The block's left side on screen, the radius in pixels, and rows beside the middle of
+        // the side, far enough from its ends that every sample's copy spans them all.
+        let edge = at(Vec3::new(0.0, 0.0, 16.0)).0;
+        let reach = (at(Vec3::new(f64::from(RADIUS), 0.0, 0.0)).0 - at(Vec3::ZERO).0).abs();
+        let (a, b) = (at(Vec3::new(-10.0, 10.0, 0.0)).1.round() as usize, at(Vec3::new(-10.0, -10.0, 0.0)).1.round() as usize);
+        let (y0, y1) = (a.min(b), a.max(b));
+        assert!(reach > 100.0 && y1 > y0 + 20, "{reach} px, rows {y0}..{y1}");
+        let lum = |img: &[u8], x: usize, y: usize| img[(y * SIZE as usize + x) * 4..][..3].iter().map(|&c| f64::from(c)).sum::<f64>();
+        // The plate's visibility in each column: its brightness with AO over its brightness
+        // without, averaged over the rows.
+        let column = |x: usize| (y0..y1).map(|y| lum(&on, x, y) / lum(&off, x, y).max(1.0)).sum::<f64>() / (y1 - y0) as f64;
+        // From 30 px beyond the radius up to 4 px from the block (its outline).
+        let from = (edge - reach - 30.0) as usize;
+        let profile: Vec<f64> = (from..=(edge - 4.0) as usize).map(column).collect();
+        let (clear, shaded) = (&profile[..20], &profile[30..]);
+        let step = shaded.windows(2).map(|p| (p[1] - p[0]).abs()).fold(0.0, f64::max);
+        eprintln!(
+            "plate {} without AO; edge {edge:.1} px, radius {reach:.1} px, rows {y0}..{y1}; clear {:.4}..{:.4}; next to the block {:.4}; largest step {step:.4}",
+            lum(&off, from, y0) / 3.0,
+            clear.iter().copied().fold(f64::INFINITY, f64::min),
+            clear.iter().copied().fold(0.0, f64::max),
+            profile[profile.len() - 1],
+        );
+        assert!(profile[profile.len() - 1] < 0.98, "the plate darkens beside the block: {:.4}", profile[profile.len() - 1]);
+        assert!(clear.iter().all(|v| (v - 1.0).abs() < 0.004), "the plate is clear beyond the radius: {clear:?}");
+        assert!(step < 0.005, "no copies of the block's outline: a step of {step:.4} between neighbouring columns");
+    }
+
     /// A hovered face lights solidly over a body drawn from its display plan on the GPU: the
     /// highlight uses the plan's triangles, not the reference mesh's other triangulation of the
     /// same face, which fought the model at equal depth and shimmered in wedges. Every face of a
@@ -5718,6 +5780,43 @@ mod tests {
             .map(|(_, e)| e.len().saturating_sub(1))
             .sum();
         assert_eq!(merged.lines.len(), 3 * segments * crate::gpu::LINE_SIZE);
+    }
+
+    #[test]
+    fn imported_mesh_edges_draw_in_each_style_without_brep_picks() {
+        let h = crate::scenario::Harness::new();
+        let path = h.dir.join("box.3mf");
+        let mut app = SolveApp::new(solidcraft_engine::Session::default(), crate::Services::default());
+        app.run("solid.box", json!({"length":20,"width":20,"height":10})).unwrap();
+        app.run("file.save_mesh", json!({"path":path})).unwrap();
+        app.run("file.new", json!({})).unwrap();
+        let imported = app.run("file.insert_mesh", json!({"path":path})).unwrap();
+        app.run("component.activate", json!({"component":"root"})).unwrap();
+        app.run("occurrence.copy", json!({"component":imported["component"],"translate":[40,0,0]})).unwrap();
+        app.ui.show_grid = false;
+        app.set_origin_shown(false);
+        app.ui.ground_shadow = false;
+        app.fit_view();
+        for style in 0..4 {
+            app.ui.visual_style = style;
+            let scene = build_scene(&app).merged();
+            let lines = if style == 1 { 0 } else { 24 * crate::gpu::LINE_SIZE };
+            assert_eq!(scene.lines.len(), lines, "style {style}: twelve edges per placed box");
+            assert_eq!(scene.hidden.len(), if style == 3 { lines } else { 0 });
+            assert_eq!(scene.tris.is_empty(), style == 2, "wireframe draws only the edges");
+        }
+        let proj = projection(&app, Rect::from_min_size(Pos2::ZERO, vec2(800., 600.)));
+        for body in &app.session.world_state().bodies {
+            let mesh = body.mesh();
+            assert_eq!(mesh.edges.len(), 12, "the placed mesh keeps its outlines");
+            for (i, edge) in mesh.edges.iter().enumerate() {
+                assert!(!mesh.edge_pickable(i), "placements keep display-only edge semantics");
+                for point in [edge[0], (edge[0] + edge[1]) * 0.5] {
+                    let hits = pick_all(&app, &proj, proj.to_screen(point).unwrap());
+                    assert!(!hits.iter().any(|h| matches!(h, Hit::Edge { .. } | Hit::Vertex { .. })), "{hits:?}");
+                }
+            }
+        }
     }
 
     /// Manual GPU benchmark: 25 placements of the mesh `SOLIDCRAFT_BENCH_MESH` (an STL, OBJ or

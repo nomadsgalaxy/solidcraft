@@ -12,6 +12,7 @@ use crate::ui_kit::{Container, Surface};
 pub mod access;
 pub mod agent_chat;
 pub mod agent_cursor;
+pub mod ai_connect;
 pub mod bom_panel;
 pub mod browser;
 pub mod browser_canvas;
@@ -90,6 +91,7 @@ pub mod install;
 pub mod issue_report;
 pub mod joint_drag;
 pub mod keymap;
+mod length_input;
 mod linked_source;
 #[cfg(test)]
 mod loft_rails_dialog_tests;
@@ -385,6 +387,8 @@ pub struct Services {
 }
 
 pub struct SolveApp {
+    /// Compact browser embed: retain model panels and joint controls without application chrome.
+    pub embedded: bool,
     pub session: Session,
     pub ui: UiState,
     pub(crate) shell: shell::State,
@@ -527,6 +531,8 @@ pub struct SolveApp {
     pub agent: agent_cursor::AgentCursor,
     /// The agent chat panel (docs/design/in-app-agent-chat.md).
     pub agent_chat: agent_chat::AgentChat,
+    /// Making SolidCraft available to the AI apps installed here ([`ai_connect`]).
+    pub ai_connect: ai_connect::State,
     pending_shots: Vec<(u64, Option<String>, std::sync::mpsc::Sender<Value>, f64)>,
     shot_chat_turns: std::collections::HashMap<u64, std::sync::Arc<std::sync::atomic::AtomicBool>>,
     queued_shots: Vec<(u64, f64, u32)>,
@@ -654,6 +660,7 @@ impl SolveApp {
             synthetic_mods: egui::Modifiers::default(),
             control_rx: None,
             agent_chat: Default::default(),
+            ai_connect: Default::default(),
             control_held: Default::default(),
             control_job: None,
             control_answering: Vec::new(),
@@ -666,6 +673,7 @@ impl SolveApp {
             fitted: false,
             pending_fit: None,
             flat_view: Default::default(),
+            embedded: false,
             home: home::HomeState::default(),
             space_mouse: Default::default(),
             file_load: file_load::FileLoad::default(),
@@ -738,6 +746,7 @@ impl SolveApp {
             self.render_workspace.defer_path_host(key, move || solidcraft_gpu::path::host_on_adapter(&adapter).map_err(|e| e.to_string()));
         }
         render_workspace::sync_backend(self);
+        ai_connect::tick(self);
         self.msaa_supported = rs.msaa_supported.clone();
         let info = rs.adapter.get_info();
         self.help.gpu = Some(format!("{} ({:?}, {:?})", info.name.trim(), info.backend, info.device_type));
@@ -1717,7 +1726,9 @@ impl SolveApp {
             if !keymap::capturing(self) {
                 expression_complete::begin_frame(ctx);
             }
-            toolbar::shortcuts(self, ctx);
+            if !self.embedded {
+                toolbar::shortcuts(self, ctx);
+            }
         }
         recovery_ui::tick(self);
         open_elsewhere::tick(self, ctx);
@@ -1819,11 +1830,19 @@ impl SolveApp {
     }
 
     fn cad_ui(&mut self, ui: &mut egui::Ui, report_input: &mut Option<issue_report::CadInput>) {
+        if self.embedded {
+            self.ui.layout = shell::LayoutMode::Docked;
+            self.home.open = false;
+            self.ui.show_browser = true;
+            self.ui.show_timeline = true;
+        }
         self.ui.layout.publish(ui.ctx());
         scenario::clear_handles();
         self.poll_deferred(ui.ctx());
         self.poll_delete_check(ui.ctx());
-        toolbar::app_bar(self, ui);
+        if !self.embedded {
+            toolbar::app_bar(self, ui);
+        }
         issue_report::CadInput::block(self, ui, report_input);
         file_load::show(self, ui.ctx());
         open_meshing::show(self, ui.ctx());
@@ -1850,7 +1869,7 @@ impl SolveApp {
         let show_timeline = self.ui.show_timeline && !render_workspace::active(self);
         let left_timeline = show_timeline && self.preferences.timeline_left;
         timeline_left::animate_folds(self, ui.ctx());
-        if !floating {
+        if !floating && !self.embedded {
             toolbar::toolbar(self, ui);
         }
         theme::TabAccent::publish(self, ui.ctx());
