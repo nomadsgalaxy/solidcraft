@@ -31,6 +31,13 @@ applies what you typed, and **Up/Down** picks one of them first. A unit right af
 (`10 mm`) is left alone; anywhere else a unit is a prefix like any other, so `rad` followed by
 **Enter** gives `radius`.
 
+With **Preferences › Design › Step values with the arrow keys and the wheel** on (it is off
+by default) and no suggestions open, **Up/Down** step a plain number in any value field (a dialog's rows,
+the value box beside the geometry, a sketch dimension, a parameter's expression) by 1 in the
+unit it is written in: `20 mm` becomes `21 mm`, `2,5 mm` becomes `3,5 mm`. Hold **Shift** for 10
+or **Alt/Option** for 0.1. The mouse wheel over the focused field does the same, a step a notch,
+and the preview follows each step. An expression such as `width / 2` is left as typed.
+
 Expressions are unit-aware: `2 * width + 5 mm`, `angle / 2`, `sqrt(area)`, `1 in + 3 mm`, using
 `+ - * / ^`, parentheses, `sin cos tan asin acos atan atan2 sqrt abs min max floor ceil round mod
 trunc` and unit conversion. A decimal comma works too, outside parentheses: `2,5 mm` is
@@ -58,3 +65,21 @@ The table's Library picker selects material or appearance values. Choose **Follo
 to clear an appearance override. Custom looks retain their colour and opacity across
 activation, undo and save/reopen. See
 [configuration commands and examples](https://github.com/bherbruck/solidcraft/blob/main/docs/configurations.md).
+
+## Checking a design across a parameter's range
+
+**Parameter Sweep** (`inspect.parameter_sweep`) rebuilds a copy of the design at each of a
+parameter's values and reports what no longer holds, so a design meant to be driven by its
+parameters (one template, many sizes) can be checked before it is trusted. The design itself is
+not changed.
+
+```json
+{"command": "inspect.parameter_sweep", "params": {"parameter": "Width", "from": 300, "to": 510, "steps": 21}}
+```
+
+`values` lists the values instead (numbers or expressions). For each value it gives the rebuild's
+time and what changed from the design as it is now: features that fail (`failed`) or warn
+(`warned`), joints whose origin is no longer found (`joints_lost`) or turned over on its own part
+(`joints_flipped`, more than 90°), sketch planes that turned over (`sketches_flipped`) and sketch
+solves that fail or only hold by flipping a triangle's turn or an offset's side (`sketches_failed`).
+`summary` counts the values that show each.

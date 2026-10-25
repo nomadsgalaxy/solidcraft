@@ -68,14 +68,7 @@ pub fn anchor(app: &SolveApp, d: &Dialog) -> Option<(Vec3, Option<Vec3>)> {
         }
         // A corner picked into a sketch window ("<sketch id>:<point id>", or a bare id when it
         // was selected outside one): the value box sits on the corner itself.
-        Sel::SketchPoint { id } => {
-            let (sketch, point) = match id.split_once(':') {
-                Some((sketch, point)) => (sketch.parse().ok()?, point),
-                None => (app.session.active_sketch?, id.as_str()),
-            };
-            let ss = st.sketch(sketch)?;
-            (ss.plane.to_world(ss.sketch.point(ss.sketch.resolve_point(point)?)?), None)
-        }
+        Sel::SketchPoint { id } => (sketch_point_at(app, &st, id)?, None),
         Sel::Body { name } => (st.body(name)?.mesh().bounds().center(), None),
         // A feature picked as a whole (a pattern or mirror of features): the middle of what it
         // made, as a body sits at the middle of its box.
@@ -132,6 +125,11 @@ pub fn anchor(app: &SolveApp, d: &Dialog) -> Option<(Vec3, Option<Vec3>)> {
             (at, along_face.or_else(|| st.body(body).and_then(|b| blend_grow_dir(&b.mesh(), *index, at))))
         }
         Kind::Fillet { .. } | Kind::Shell { .. } => (at, normal.map(|n| -n)),
+        // A hem's handle starts on the centre line of its layer and runs to its tip (#5828).
+        Kind::Sheet(crate::dialogs_sheet::Sm::Hem { .. }) => match crate::dialogs_sheet::hem_handle(app, d) {
+            Some((start, dir)) => (start, Some(dir)),
+            None => (at, normal),
+        },
         Kind::Sheet(_) => (at, crate::dialogs_sheet::arrow(app, d).or(normal)),
         Kind::Plastic(_) => (at, normal),
         Kind::PatternRect { .. } => (at, d.inputs.get(1).and_then(|i| i.items.first()).and_then(|x| crate::dialogs::axis_of(app, x)).map(|a| a.1)),
@@ -386,6 +384,16 @@ pub(crate) fn format_len(v: f64) -> String {
     format!("{} mm", if s == "-0" { "0" } else { s })
 }
 
+/// Where a sketch point picked as "<sketch id>:<point id>" (or a bare id of the active sketch) is.
+fn sketch_point_at(app: &SolveApp, st: &solidcraft_engine::doc::ModelState, id: &str) -> Option<Vec3> {
+    let (sketch, point) = match id.split_once(':') {
+        Some((sketch, point)) => (sketch.parse().ok()?, point),
+        None => (app.session.active_sketch?, id),
+    };
+    let ss = st.sketch(sketch)?;
+    Some(ss.plane.to_world(ss.sketch.point(ss.sketch.resolve_point(point)?)?))
+}
+
 /// The offset plane preview: a square of half side `h` around `c`, square to `n`.
 fn offset_plane_quad(proj: &Proj, c: Vec3, n: Vec3, h: f64) -> Option<Vec<Pos2>> {
     let u = n.cross(if n.z.abs() < 0.9 { Vec3::Z } else { Vec3::X }).normalized()?;
@@ -485,9 +493,14 @@ fn draw(app: &SolveApp, ui: &mut egui::Ui, painter: &egui::Painter, proj: &Proj,
             drag_arrow(ui, painter, proj, base, bs, n2, l2, false, egui::Id::new("sc_manipulator2"), half_height, spacing2);
         }
     }
-    // An offset plane shows where it will be.
+    // An offset plane shows where it will be: at the distance, or through the picked point.
+    let through = crate::dialogs::offset_through_point(d).and_then(|p| match p {
+        Sel::Vertex { point, .. } => Some(*point),
+        Sel::SketchPoint { id } => sketch_point_at(app, &app.session.world_state(), id),
+        _ => None,
+    });
     if let (Kind::OffsetPlane { offset }, Some(n)) = (&d.kind, dir)
-        && let Ok(off) = app.session.doc.eval(offset, ValueKind::Length)
+        && let Some(off) = through.map(|p| (p - base).dot(n)).or_else(|| app.session.doc.eval(offset, ValueKind::Length).ok())
         && let Some(q) = offset_plane_quad(proj, base + n * off, n, half_height * 0.25)
     {
         painter.extend(projected_polygon(&q, t.construction_plane, Stroke::new(1.2, t.origin_plane_edge)));
@@ -547,6 +560,29 @@ fn draw(app: &SolveApp, ui: &mut egui::Ui, painter: &egui::Painter, proj: &Proj,
     if radius_spline_handles(app, ui, painter, proj, d) {
         dir = None;
     }
+    // Two-sided sketch offset: Distance 2 is its own dimension, the other way from Distance.
+    // One Side and Symmetric keep the single Distance box.
+    if let Kind::SketchModify(crate::sketch_modify_ui::Mod::Offset { distance2, mode, .. }) = &mut d.kind
+        && crate::sketch_modify_ui::offset_two_sides(*mode)
+        && let Some(n) = dir
+        && let Some(l2) = app.session.doc.eval(distance2, ValueKind::Length).ok().filter(|v| v.is_finite())
+    {
+        let before = distance2.clone();
+        if let Some(ts) =
+            drag_arrow(ui, painter, proj, base, bs, -n, l2.abs(), false, egui::Id::new("sc_manipulator_offset2"), half_height, distance2)
+        {
+            // Its own area and field, so it does not share Distance's focus or text.
+            value_box_in(
+                ui,
+                (egui::Id::new("sc_canvas_area2"), egui::Id::new("sc_canvas_value2")),
+                "Distance 2",
+                distance2,
+                (ts + vec2(14.0, 8.0), egui::Align2::LEFT_TOP),
+                *distance2 != before,
+                false,
+            );
+        }
+    }
     let Some((label, kind, value)) = d.primary() else { return };
     let len = all_span.or_else(|| {
         if to_span.is_some() && value.trim().is_empty() { Some(0.0) } else { app.session.doc.eval(value, kind).ok().filter(|v| v.is_finite()) }
@@ -589,7 +625,10 @@ fn draw(app: &SolveApp, ui: &mut egui::Ui, painter: &egui::Painter, proj: &Proj,
 /// top-left corner. `select_all` re-selects the whole field, both right after a pick and on every
 /// frame a drag is changing the value underneath it: without the latter, a drag that grows the
 /// text (e.g. "4 mm" -> "15 mm") would leave the stale, shorter selection from the pick in place,
-/// covering only part of the new text.
+/// covering only part of the new text. With value stepping on, the box stays where it is while
+/// the pointer is over it: the wheel steps its value (`value_step`), which moves the arrow tip
+/// the box follows, and a box sliding out from under the pointer would hand the next notch to
+/// the camera.
 fn value_box(ui: &mut egui::Ui, label: &str, value: &mut String, at: Pos2, select_all: bool) {
     value_box_with(ui, label, value, at, select_all, false);
 }
@@ -633,6 +672,14 @@ fn value_box_full(
     note: Option<&str>,
 ) -> Option<egui::Rect> {
     let t = Tokens::get();
+    // Held in place while the pointer is over it and value stepping is on (see `value_box`): by
+    // its pivot, the point of the box that sits at `at`, which is not always its top-left corner.
+    let pointer = ui.ctx().pointer_hover_pos();
+    let at = ui
+        .ctx()
+        .memory(|m| m.area_rect(area))
+        .filter(|r| crate::value_step::enabled(ui.ctx()) && pointer.is_some_and(|p| r.contains(p)))
+        .map_or(at, |r| pivot.pos_in_rect(&r));
     let mut field = None;
     Container::new(ui.ctx(), Surface::Canvas).area(area).fixed_pos(at).pivot(pivot).order(egui::Order::Foreground).show(ui.ctx(), |ui| {
         Container::popup_frame(ui.style()).inner_margin(egui::Margin::symmetric(6, 3)).show(ui, |ui| {

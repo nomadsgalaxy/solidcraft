@@ -222,6 +222,12 @@ pub struct MenuState {
     pub over_geometry: bool,
     /// The plane under the cursor when the viewport menu opened: it offers a sketch on it.
     pub plane: Option<String>,
+    /// Where the viewport menu opened and the keys held at that click (Select Other adds with
+    /// them).
+    opened: Option<(Pos2, crate::tool_modifiers::Held)>,
+    /// The viewport menu's right-click selected what was under it: where the menu opened, the
+    /// selection before and the one it made. Select Other puts the one before back.
+    picked: Option<(Pos2, Vec<Sel>, Vec<Sel>)>,
     /// The button that opened the menu, when it toggles it: a press there is not a press outside,
     /// so its click closes the menu instead of closing and reopening it (#1522).
     opener: Option<Rect>,
@@ -451,8 +457,7 @@ fn picked_face_feature(app: &SolveApp) -> Option<u64> {
     let body = state.body(body)?;
     let names = solidcraft_engine::doc::naming::face_names(body);
     let name = names.get(index)?;
-    let (creator, _) = name.strip_prefix('F')?.split_once(':')?;
-    let id = creator.parse::<u64>().ok()?;
+    let id = solidcraft_engine::doc::persistent_name::made_by(name)?;
     let owner = app.session.doc.feature(body.feature)?;
     if matches!(owner.kind, solidcraft_engine::doc::FeatureKind::Import { .. } | solidcraft_engine::doc::FeatureKind::MeshImport { .. })
         && id != owner.id
@@ -919,8 +924,26 @@ fn sketch_entity_items(app: &SolveApp) -> Vec<Item> {
             _ => {}
         }
     }
+    // Dimensions (#320): a selected dimension switches between driving and driven through the
+    // engine's `sketch.toggle_driven`, which takes one constraint, so the item appears for a
+    // single selected dimension. Non-dimension constraints (coincident, tangent, ...) have no
+    // driven state and get no item.
+    let dims: Vec<String> = app
+        .session
+        .selection
+        .iter()
+        .filter_map(|s| match s {
+            Sel::SketchConstraint { id } => Some(id.clone()),
+            _ => None,
+        })
+        .filter(|id| ss.sketch.constraints.iter().any(|c| &c.id == id && c.kind.value().is_some()))
+        .collect();
     let mut v = Vec::new();
     if curves.is_empty() && points.is_empty() {
+        if dims.len() == 1 {
+            v.push(cmd(app, "sketch.toggle_driven", "Toggle Driven Dimension").with(json!({ "constraint": dims[0] })));
+            v.push(Item::sep());
+        }
         if crate::sketch_text::selected_entity(app).is_some() {
             v.push(cmd(app, "sketch.edit_text", "Edit Text"));
             v.extend(explode_text(app));
@@ -1046,7 +1069,15 @@ pub fn run_item(app: &mut SolveApp, item: &Item, at: Pos2) {
             app.repeat_last();
         }
         "ui.selectOther" => {
-            crate::select_other::open(app, at);
+            // The list picks instead of the right-click.
+            if let Some((opened, before, made)) = app.menu.picked.take()
+                && opened == at
+                && app.session.selection == made
+            {
+                let _ = app.run("select.set", json!({ "items": before }));
+            }
+            let held = app.menu.opened.filter(|(opened, _)| *opened == at).map(|(_, held)| held).unwrap_or_default();
+            crate::select_other::open(app, at, held);
         }
         "ui.delete" if item.params.is_some() => crate::delete::request(app, p),
         "ui.delete" => delete(app),
@@ -1178,6 +1209,7 @@ pub fn run_item(app: &mut SolveApp, item: &Item, at: Pos2) {
                     crate::browser::reveal_feature(app, f, body);
                 }
                 let _ = app.run("select.set", json!({"items": [{"type": "feature", "id": f}]}));
+                app.tree.timeline_reveal = Some(f);
             }
         }
         "ui.tangentChain" => tangent_chain(app),
@@ -1543,8 +1575,11 @@ fn context_target_selected(selection: &[Sel], target: &Sel) -> bool {
 
 /// Open the viewport menu at a screen position. A right-click on something not selected
 /// selects it first, so the menu is about what is under the cursor; a face or edge already in a
-/// multi-selection keeps the whole selection (#3733).
-pub fn open(app: &mut SolveApp, at: Pos2) {
+/// multi-selection keeps the whole selection (#3733). `held`: the keys held at that click.
+pub fn open(app: &mut SolveApp, at: Pos2, held: crate::tool_modifiers::Held) {
+    app.menu.opened = Some((at, held));
+    app.menu.picked = None;
+    let before = app.session.selection.clone();
     app.menu.over_geometry = app.viewport.hover.is_some();
     // A right-click leaves a plane unselected, but the menu offers a sketch on it.
     app.menu.plane = app.viewport.hover.clone().and_then(|h| crate::viewport::candidate(app, &[h])).and_then(|(_, sel)| match sel {
@@ -1560,6 +1595,7 @@ pub fn open(app: &mut SolveApp, at: Pos2) {
         && !matches!(sel, Sel::Plane { .. } | Sel::Axis { .. })
     {
         let _ = app.run("select.set", json!({ "items": [sel] }));
+        app.menu.picked = Some((at, before, app.session.selection.clone()));
     } else if app.session.active_sketch.is_some()
         && let Some(h) = app.viewport.hover.clone()
         && let Some((_, sel)) = crate::viewport::candidate(app, &[h])
@@ -1568,6 +1604,7 @@ pub fn open(app: &mut SolveApp, at: Pos2) {
         && !context_target_selected(&app.session.selection, &sel)
     {
         let _ = app.run("select.set", json!({ "items": [sel] }));
+        app.menu.picked = Some((at, before, app.session.selection.clone()));
     }
     open_for(app, at, Target::Viewport);
 }
@@ -1752,7 +1789,7 @@ fn track_hold(app: &mut SolveApp, ctx: &egui::Context) {
             app.menu.press = None;
         } else if time - t0 > 0.35 {
             app.menu.press = None;
-            open(app, p0);
+            open(app, p0, crate::tool_modifiers::Held::from_modifiers(ctx.input(|i| i.modifiers)));
             app.menu.flick = true;
         } else {
             ctx.request_repaint_after(std::time::Duration::from_millis(30));
@@ -1780,7 +1817,7 @@ pub fn show(app: &mut SolveApp, ctx: &egui::Context) {
         && app.synthetic.is_empty()
     {
         app.menu.pending = None;
-        if target == Target::Viewport { open(app, at) } else { open_for(app, at, target) }
+        if target == Target::Viewport { open(app, at, crate::tool_modifiers::Held::default()) } else { open_for(app, at, target) }
     }
     crate::browser::dims_overlay(app, ctx);
     track_hold(app, ctx);
@@ -2015,6 +2052,100 @@ pub fn finish_rename(app: &mut SolveApp, text: Option<&str>, commit: bool) -> bo
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #320: a selected sketch dimension gets the Toggle Driven Dimension item, it round-trips
+    /// driving -> driven -> driving, and non-dimension selections get no such item.
+    #[test]
+    fn dimension_menu_toggles_driving_driven_and_other_selections_get_no_item() {
+        let mut h = crate::scenario::Harness::new();
+        h.app.home.open = false;
+        h.app.run("sketch.create", json!({"plane":"XY"})).unwrap();
+        let sid = h.app.session.active_sketch.unwrap();
+        let l = h.app.run("sketch.line", json!({"points":[[0,0],[20,0]],"connect":false,"infer":false})).unwrap()["curves"][0]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let dparam = h.app.run("sketch.dimension", json!({"entities":[l],"value":10})).unwrap()["param"].as_str().unwrap().to_owned();
+        let dim = h.app.run("sketch.glyphs", json!({})).unwrap()["glyphs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|x| x["param"].as_str() == Some(dparam.as_str()))
+            .and_then(|x| x["id"].as_str())
+            .expect("the dimension glyph carries its constraint id")
+            .to_owned();
+        let horiz = h.app.run("sketch.constrainer", json!({"entities":[l]})).unwrap()["constraint"].as_str().unwrap().to_owned();
+        let is_driven = |h: &crate::scenario::Harness| {
+            h.app.session.world_state().sketch(sid).unwrap().sketch.constraints.iter().any(|c| c.id == dim && c.driven)
+        };
+
+        // A selected dimension offers the toggle, aimed at that constraint.
+        h.app.session.selection = vec![Sel::SketchConstraint { id: dim.clone() }];
+        let menu = items(&h.app, &Target::Viewport);
+        let item = menu.iter().find(|i| i.id == "sketch.toggle_driven").expect("a selected dimension must offer Toggle Driven Dimension");
+        assert!(item.enabled);
+        assert_eq!(item.params, Some(json!({"constraint": dim})));
+
+        // Running it flips the state both ways.
+        run_item(&mut h.app, item, egui::pos2(0.0, 0.0));
+        assert!(is_driven(&h), "the dimension is driven now");
+        let menu = items(&h.app, &Target::Viewport);
+        let item = menu.iter().find(|i| i.id == "sketch.toggle_driven").expect("a driven dimension still offers the toggle");
+        run_item(&mut h.app, item, egui::pos2(0.0, 0.0));
+        assert!(!is_driven(&h), "and driving again");
+
+        // A non-dimension constraint, and a plain curve, get no toggle item.
+        h.app.session.selection = vec![Sel::SketchConstraint { id: horiz }];
+        assert!(!items(&h.app, &Target::Viewport).iter().any(|i| i.id == "sketch.toggle_driven"), "a horizontal constraint is not a dimension");
+        h.app.session.selection = vec![Sel::SketchCurve { id: l }];
+        assert!(!items(&h.app, &Target::Viewport).iter().any(|i| i.id == "sketch.toggle_driven"));
+    }
+
+    #[test]
+    fn units_toolbar_start_offers_choices_and_one_undo_step() {
+        let mut h = crate::scenario::Harness::new();
+        h.app.home.open = false;
+        h.call("ui.start", json!({"command":"document.units"}));
+        assert!(!h.app.status.as_ref().is_some_and(|(_, _, error)| *error));
+        assert_eq!(h.app.menu.target, Target::Units);
+        assert!(h.app.viewport.context_menu.is_some());
+        let menu = describe(&h.app);
+        let choices = menu["items"].as_array().unwrap();
+        assert_eq!(choices.iter().map(|item| item["label"].as_str().unwrap()).collect::<Vec<_>>(), crate::prefs::UNITS);
+        assert!(choices.iter().all(|item| item["enabled"] == true));
+        assert!(h.app.session.undo.is_empty());
+        h.call("ui.menuPick", json!({"item":"in"}));
+        assert_eq!(h.app.session.doc.units, "in");
+        assert!(h.app.viewport.context_menu.is_none());
+        assert_eq!(h.app.session.undo.len(), 1);
+        h.app.run("edit.undo", json!({})).unwrap();
+        assert_eq!(h.app.session.doc.units, "mm");
+        h.app.run("edit.redo", json!({})).unwrap();
+        assert_eq!(h.app.session.doc.units, "in");
+    }
+
+    #[test]
+    fn units_toolbar_menu_is_anchored_and_programmatic_calls_stay_headless() {
+        let mut h = crate::scenario::Harness::new();
+        h.app.home.open = false;
+        let missing = h.call("engine.execute", json!({"command":"document.units","params":{}}));
+        assert_eq!(missing["ok"], false);
+        assert!(h.app.viewport.context_menu.is_none());
+        let changed = h.call("engine.execute", json!({"command":"document.units","params":{"units":"cm"}}));
+        assert_eq!(changed["ok"], true);
+        assert_eq!(h.app.session.doc.units, "cm");
+        assert!(h.app.viewport.context_menu.is_none());
+        h.app.status = None;
+        h.step(&json!({"click":{"handle":"tab:MANAGE"}})).unwrap();
+        let button = crate::scenario::rect_of("button:document.units").unwrap();
+        h.step(&json!({"click":{"handle":"button:document.units"}})).unwrap();
+        assert_eq!(h.app.viewport.context_menu, Some(button.left_bottom()));
+        assert_eq!(h.app.menu.target, Target::Units);
+        assert!(!h.app.status.as_ref().is_some_and(|(_, _, error)| *error));
+        assert_eq!(items(&h.app, &Target::Units).iter().find(|item| item.label == "cm").unwrap().shortcut, "current");
+        h.step(&json!({"click":{"handle":"button:document.units"}})).unwrap();
+        assert!(h.app.viewport.context_menu.is_none());
+    }
 
     #[test]
     fn line_offset_context_menu_breaks_association_and_allows_trim() {

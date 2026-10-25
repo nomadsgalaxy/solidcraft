@@ -524,9 +524,10 @@ pub(super) fn rows(app: &mut SolveApp, ctx: &egui::Context, d: &mut Dialog, ui: 
             });
             if opts.tapped {
                 enter |= crate::dialogs_thread::hole_rows(ui, &app.session.doc, &mut opts.thread, &mut opts.custom_thread);
+                ui_kit::checkbox_grid(ui, &mut [("Full thread depth", &mut opts.thread_full_depth)], 1);
             }
             // Through all, the tip lies past the part.
-            if *kind == 0 && !opts.all {
+            if !opts.all {
                 form_row(ui, "Drill Point", |ui| {
                     let mut tip = usize::from(opts.angled);
                     combo(ui, "hole_tip", &["Flat", "Angle"], &mut tip);
@@ -606,6 +607,7 @@ fn coil_rows(ui: &mut egui::Ui, extra: &mut serde_json::Map<String, Value>) -> b
 
 fn additional_rows(app: &mut SolveApp, d: &mut Dialog, ui: &mut egui::Ui) -> bool {
     let mut enter = false;
+    let through_point = offset_through_point(d).is_some();
     match &mut d.kind {
         Kind::Revolve { angle, operation, .. } => {
             let cur = usize::from(to_object_on(&d.inputs));
@@ -672,7 +674,9 @@ fn additional_rows(app: &mut SolveApp, d: &mut Dialog, ui: &mut egui::Ui) -> boo
             }
         }
         Kind::OffsetPlane { offset } => {
-            enter |= expr_row(ui, "Distance", offset);
+            if !through_point {
+                enter |= expr_row(ui, "Distance", offset);
+            }
         }
         Kind::AnglePlane { angle } => {
             enter |= expr_row(ui, "Angle", angle);
