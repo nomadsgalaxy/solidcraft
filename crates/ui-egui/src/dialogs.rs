@@ -604,7 +604,8 @@ fn fits(a: Accept, s: &Sel) -> bool {
         // Sketch points go into a sketch command's own inputs (Entities, a base point), so a
         // box selection and a pre-selection reach them the way a click already does.
         Sel::SketchPoint { .. } => a & (selection::POINTS | selection::SKETCH_POINTS) != 0,
-        Sel::SketchMidpoint { .. } | Sel::SketchConstraint { .. } | Sel::Occurrence { .. } | Sel::ExternalSketchPoint { .. } => false,
+        Sel::ExternalSketchPoint { .. } => a & selection::EXTERNAL_POINTS != 0,
+        Sel::SketchMidpoint { .. } | Sel::SketchConstraint { .. } | Sel::Occurrence { .. } => false,
     }
 }
 
@@ -750,7 +751,18 @@ impl Dialog {
             ),
             "inspect.measure" => Dialog::new(
                 Kind::Measure { result: None, of: Vec::new(), show: None },
-                vec![SelInput::new("Items", FACES | EDGES | selection::VERTICES | selection::CURVES | PROFILES, true)],
+                vec![SelInput::new(
+                    "Items",
+                    FACES
+                        | EDGES
+                        | selection::VERTICES
+                        | CURVES
+                        | selection::POINTS
+                        | PROFILES
+                        | selection::SKETCH_LINES
+                        | selection::EXTERNAL_POINTS,
+                    true,
+                )],
             ),
             "solid.pattern.rectangular" => Dialog::new(
                 Kind::PatternRect { count: "3".into(), spacing: "20 mm".into(), count2: "1".into(), spacing2: "20 mm".into() },
@@ -823,7 +835,7 @@ impl Dialog {
                     operation: 0,
                     at: None,
                 },
-                vec![],
+                vec![SelInput::new("Profile", PROFILES, false)],
             ),
             "solid.combine" => Dialog::new(
                 Kind::Combine { operation: 1, keep_tools: false },
@@ -3055,7 +3067,7 @@ fn shown_origin_plane(app: &SolveApp, name: &str) -> Option<Value> {
 }
 
 /// The world plane of an origin plane or a construction plane by name, where it is shown.
-fn plane_by_name(s: &Session, name: &str) -> Option<solidcraft_engine::geom::Plane> {
+pub(crate) fn plane_by_name(s: &Session, name: &str) -> Option<solidcraft_engine::geom::Plane> {
     if let Some(p) = solidcraft_engine::geom::Plane::named(name) {
         return Some(p);
     }
@@ -3917,6 +3929,14 @@ fn dialog_commands(app: &SolveApp, d: &Dialog) -> Result<Vec<(String, Value)>, S
             for (k, v) in fields {
                 p.insert((*k).into(), json!(v));
             }
+            if *cmd == "solid.coil"
+                && let Some((sketch, index)) = sels(d, 0).profiles().first().copied()
+            {
+                p.insert("sketch".into(), json!(sketch));
+                p.insert("profiles".into(), json!([index]));
+                p.remove("diameter");
+                p.remove("section_size");
+            }
             if let Some((point, normal)) = *at {
                 match *cmd {
                     "solid.box" => {
@@ -4763,19 +4783,40 @@ pub fn for_feature(app: &SolveApp, id: u64, marker: Option<usize>) -> Option<Dia
             d.extra.insert("center".into(), pt_expr(center));
             d
         }
-        FeatureKind::Coil { base, axis, diameter, pitch, turns, section_size, section, position, start_angle, clockwise, operation, targets } => {
+        FeatureKind::Coil {
+            base,
+            axis,
+            sketch,
+            profiles,
+            diameter,
+            pitch,
+            turns,
+            section_size,
+            section,
+            position,
+            start_angle,
+            clockwise,
+            operation,
+            targets,
+        } => {
             let mut d = start("solid.coil")?;
             d.kind = Kind::Primitive {
                 cmd: "solid.coil",
                 fields: vec![
-                    ("diameter", stored_length(s, diameter)),
+                    ("diameter", diameter.as_ref().map(|e| stored_length(s, e)).unwrap_or_default()),
                     ("revolutions", turns.to_string()),
                     ("pitch", stored_length(s, pitch)),
-                    ("section_size", stored_length(s, section_size)),
+                    ("section_size", section_size.as_ref().map(|e| stored_length(s, e)).unwrap_or_default()),
                 ],
                 operation: op_index(operation),
                 at: None,
             };
+            if let Some(sketch) = sketch {
+                let items = st.sketch(sketch.0).map(|ss| profile_indices(ss, profiles)).unwrap_or_default();
+                if let Some(inp) = d.inputs.get_mut(0) {
+                    inp.items = items.into_iter().map(|index| Sel::Profile { sketch: sketch.0, index }).collect();
+                }
+            }
             d.extra.insert("base".into(), pt_expr(base));
             d.extra.insert("axis".into(), pt3(axis.0));
             if *section == solidcraft_engine::doc::CoilSection::Square {

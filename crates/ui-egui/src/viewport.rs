@@ -61,6 +61,9 @@ pub struct ViewportState {
     /// Per-body boxes of one world state, held (not just its address, which a later state can
     /// reuse once the old one is freed, so stale boxes would come back).
     pick_bounds: std::sync::Mutex<Option<BodyBounds>>,
+    /// The sketches' box in the world of one world state (held, as `pick_bounds` is). Every
+    /// `projection` reads it, several times a frame, and each sketch's box samples its curves.
+    sketch_bounds: std::sync::Mutex<Option<(std::sync::Arc<solidcraft_engine::doc::ModelState>, solidcraft_engine::geom::Aabb3)>>,
     /// The model scene's blocks of bodies by key, from the last scene built.
     pub(crate) blocks: std::sync::Mutex<std::collections::HashMap<u64, CachedBlock>>,
     /// The triangles of each mesh the last scene drew as instances, by the mesh's address (the
@@ -156,6 +159,8 @@ pub struct ViewportState {
     pub(crate) joint_drag: Option<crate::joint_drag::Drag>,
     /// A free part being dragged to a new place (#2804).
     pub(crate) occurrence_drag: Option<crate::occurrence_drag::Drag>,
+    /// Extrude by pulling a face or profile.
+    pub(crate) drag_extrude: crate::drag_extrude::State,
     /// The plane the grid was last drawn on while Preferences ▸ Grid follows the view is on
     /// (#1470), kept so the choice is hysteretic near the thresholds (#1993).
     pub(crate) grid_plane: std::sync::Mutex<GridPlane>,
@@ -1352,7 +1357,24 @@ type BodyBounds = (std::sync::Arc<solidcraft_engine::doc::ModelState>, std::sync
 /// The model's extent: bodies (from the cached boxes) and sketches.
 pub fn model_bounds(app: &SolveApp) -> solidcraft_engine::geom::Aabb3 {
     let st = crate::open_meshing::shown_world(app);
-    let mut b = body_bounds(app, &st).iter().fold(solidcraft_engine::geom::Aabb3::EMPTY, |a, (_, x)| a.union(x));
+    let bodies = body_bounds(app, &st).iter().fold(solidcraft_engine::geom::Aabb3::EMPTY, |a, (_, x)| a.union(x));
+    let mut b = bodies.union(&sketch_bounds(app, &st));
+    for point in crate::sketch_attachment_ui::guide_lines(app).into_iter().flatten() {
+        b.add(point);
+    }
+    b
+}
+
+/// The box of every sketch of `st` in the world, kept for that state: a design with hundreds of
+/// sketches spent most of each frame sampling their splines again for `projection`.
+fn sketch_bounds(app: &SolveApp, st: &std::sync::Arc<solidcraft_engine::doc::ModelState>) -> solidcraft_engine::geom::Aabb3 {
+    if let Ok(g) = app.viewport.sketch_bounds.lock()
+        && let Some((k, b)) = g.as_ref()
+        && std::sync::Arc::ptr_eq(k, st)
+    {
+        return *b;
+    }
+    let mut b = solidcraft_engine::geom::Aabb3::EMPTY;
     for ss in &st.sketches {
         if let Some((lo, hi)) = ss.sketch.bounds() {
             for p in [lo, hi] {
@@ -1360,8 +1382,8 @@ pub fn model_bounds(app: &SolveApp) -> solidcraft_engine::geom::Aabb3 {
             }
         }
     }
-    for point in crate::sketch_attachment_ui::guide_lines(app).into_iter().flatten() {
-        b.add(point);
+    if let Ok(mut g) = app.viewport.sketch_bounds.lock() {
+        *g = Some((std::sync::Arc::clone(st), b));
     }
     b
 }
@@ -3513,8 +3535,9 @@ pub fn show(app: &mut SolveApp, ui: &mut egui::Ui) {
             && !crate::shell::covered(app, a)
             && !axes.contains(a)
             && !crate::occurrence_drag::start(app, &proj, a)
+            && !crate::joint_drag::start(app, &proj, a)
         {
-            crate::joint_drag::start(app, &proj, a);
+            crate::drag_extrude::press(app, &proj, a);
         }
         if resp.dragged_by(egui::PointerButton::Primary)
             && let Some(p) = hover
@@ -3534,6 +3557,15 @@ pub fn show(app: &mut SolveApp, ui: &mut egui::Ui) {
     if crate::occurrence_drag::active(app) && (resp.drag_stopped() || !ui.input(|i| i.pointer.primary_down())) {
         crate::occurrence_drag::end(app);
     }
+    // Pulling a face or profile extrudes it; the release applies.
+    if resp.dragged_by(egui::PointerButton::Primary)
+        && let Some(p) = hover
+    {
+        crate::drag_extrude::to(app, &proj, p);
+    }
+    if resp.drag_stopped() || !primary_down {
+        crate::drag_extrude::end(app);
+    }
     // Box selection: a primary drag on the model when no navigation mode is on.
     if app.tool.is_none()
         && !held
@@ -3542,6 +3574,7 @@ pub fn show(app: &mut SolveApp, ui: &mut egui::Ui) {
         && app.viewport.point_drag.is_none()
         && !crate::joint_drag::active(app)
         && !crate::occurrence_drag::active(app)
+        && !crate::drag_extrude::started(app)
         && !crate::dim_view::dragging()
         && !crate::sketch3d::dragging()
         && !crate::sketch_text_handles::dragging(app)
@@ -3579,6 +3612,8 @@ pub fn show(app: &mut SolveApp, ui: &mut egui::Ui) {
     crate::inference::show(app, &painter, &proj);
     crate::drag_snap::show(app, &painter, &proj);
     hover_highlight(app, &painter, &proj);
+    crate::drag_extrude::tick(app);
+    crate::drag_extrude::show(app, &painter);
     points_2d(app, &painter, &proj);
     if let Some((plane, sketch)) = crate::sketch_attachment_ui::lost_guide(app)
         && let Some((low, high)) = sketch.bounds()
@@ -5397,6 +5432,36 @@ mod tests {
             assert!(selection_bounds(&h.app).is_none());
             assert!(build_highlight(&h.app).merged().tris.is_empty());
         }
+    }
+
+    #[test]
+    fn history_marker_shows_only_its_sketch_without_changing_visibility() -> Result<(), Box<dyn std::error::Error>> {
+        for explicitly_hidden in [false, true] {
+            let mut app = SolveApp::new(solidcraft_engine::Session::default(), crate::Services::default());
+            app.ui.show_grid = false;
+            let mut sketches = Vec::new();
+            for (name, x) in [("First", 0), ("Second", 30)] {
+                app.run("sketch.create", json!({"plane":"XY","name":name}))?;
+                app.run("sketch.rectangle.two_point", json!({"p0":[x,0],"p1":[x+10,10]}))?;
+                app.run("sketch.finish", json!({}))?;
+                let id = app.session.doc.find_feature(name).ok_or("missing sketch")?.id;
+                sketches.push(id);
+                app.run("solid.extrude", json!({"sketch":name,"distance":5,"body_name":name}))?;
+            }
+            if explicitly_hidden {
+                app.session.visibility.hidden_sketches.clone_from(&sketches);
+            }
+            let stored = app.session.visibility.clone();
+            let rect = Rect::from_min_size(Pos2::ZERO, vec2(640., 480.));
+            for (position, expected) in [(0, None), (1, sketches.first().copied()), (2, None), (3, sketches.get(1).copied()), (4, None)] {
+                app.run("timeline.roll_to", json!({"position":position}))?;
+                assert_eq!(visible_sketches(&app), expected.into_iter().collect::<Vec<_>>(), "position {position}, hidden {explicitly_hidden}");
+                let scene = build_sketch_scene(&app, &projection(&app, rect)).merged();
+                assert_eq!(!scene.lines.is_empty(), expected.is_some(), "sketch lines at position {position}");
+                assert_eq!(app.session.visibility, stored, "stepping must preserve stored visibility");
+            }
+        }
+        Ok(())
     }
 
     #[test]

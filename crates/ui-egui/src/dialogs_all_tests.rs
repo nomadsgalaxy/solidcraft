@@ -2,6 +2,38 @@
 use super::*;
 use crate::scenario::{self, Harness};
 
+#[test]
+fn measure_input_fits_external_sketch_geometry() {
+    let mut h = Harness::new();
+    let curve = Sel::ExternalSketchCurve { sketch: 17, id: "line1".into() };
+    let point = Sel::ExternalSketchPoint { sketch: 17, id: "p1".into() };
+    h.app.session.selection = vec![curve.clone(), point.clone()];
+    let mut d = Dialog::for_command(&h.app, "inspect.measure").unwrap();
+    let accept = d.inputs.first().unwrap().accept;
+    assert!(fits(accept, &curve));
+    assert!(fits(accept, &point));
+    assert_eq!(d.items(), vec![curve.clone(), point.clone()]);
+    assert_eq!(d.candidate(&h.app.session, &Hit::SketchCurve { sketch: 17, id: "line1".into(), straight: true }), Some(curve.clone()));
+    assert_eq!(
+        d.candidate(&h.app.session, &Hit::SketchPoint { sketch: 17, id: "p1".into(), at: solidcraft_engine::geom::Vec2::new(0.0, 0.0) }),
+        Some(point.clone())
+    );
+    d.take_box(&h.app.session, vec![curve.clone(), point.clone()], false);
+    assert_eq!(d.items(), vec![curve, point]);
+}
+
+#[test]
+fn feature_inputs_reject_external_sketch_geometry() {
+    let h = Harness::new();
+    for (command, sel) in [
+        ("solid.pipe", Sel::ExternalSketchCurve { sketch: 17, id: "line1".into() }),
+        ("solid.hole", Sel::ExternalSketchPoint { sketch: 17, id: "p1".into() }),
+    ] {
+        let d = Dialog::for_command(&h.app, command).unwrap();
+        assert!(!fits(d.inputs.first().unwrap().accept, &sel), "{command}");
+    }
+}
+
 fn fixture() -> Harness {
     let mut h = Harness::new();
     for (name, x) in [("A", 0), ("B", 30), ("C", 60), ("D", 90)] {
@@ -33,6 +65,9 @@ fn representative(h: &Harness, command: &str) -> Dialog {
     for (index, input) in d.inputs.iter_mut().enumerate() {
         if command == "joint.gear" {
             continue;
+        }
+        if command == "solid.coil" {
+            continue; // an empty Profile input keeps the primitive section, which this form checks
         }
         if matches!(input.label, "Rail" | "Second Rail" | "Pass through" | "Direction" | "Roller (optional)" | "Tip (optional)") {
             continue;
@@ -469,4 +504,21 @@ fn solid_pattern_quantity_arrows_step_the_count_the_command_receives() {
         h.step(&json!({"click":{"handle":"dialog:cancel"}})).unwrap();
         h.settle();
     }
+}
+
+#[test]
+fn coil_from_a_profile_hides_the_primitive_section() {
+    let h = fixture();
+    let mut d = Dialog::for_command(&h.app, "solid.coil").unwrap();
+    let sketch = h.app.session.world_state().sketches[0].feature;
+    d.inputs[0].items = vec![Sel::Profile { sketch, index: 0 }];
+    let commands = apply_commands(&h.app, &d).unwrap();
+    let (id, p) = &commands[0];
+    assert_eq!(id, "solid.coil");
+    assert_eq!(p["sketch"], json!(sketch));
+    assert_eq!(p["profiles"], json!([0]));
+    assert!(p.get("diameter").is_none(), "{p}");
+    assert!(p.get("section_size").is_none(), "{p}");
+    assert!(p.get("revolutions").is_some() && p.get("pitch").is_some(), "{p}");
+    assert!(p.get("operation").is_some(), "{p}");
 }

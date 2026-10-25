@@ -530,8 +530,8 @@ fn viewport_items(app: &SolveApp) -> Vec<Item> {
         v.push(act("ui.delete", "Delete", "delete").key("Del"));
         v.push(act(if hidden { "ui.show" } else { "ui.hide" }, "Show/Hide", "eye").key("V").with(json!({ "bodies": [face] })));
         v.push(Item::sep());
-        v.push(act("ui.findBrowser", "Find in Browser", "list").with(json!({ "body": face, "feature": feature })).on(feature.is_some()));
-        v.push(act("ui.findTimeline", "Find in Timeline", "rollback").with(json!({ "feature": feature })).on(feature.is_some()));
+        v.push(act("ui.findBrowser", "Find in Browser", "list").with(json!({ "body": face })));
+        v.push(act("ui.findTimeline", "Find in Timeline", "rollback").with(json!({ "feature": feature, "body": face })).on(feature.is_some()));
         v.push(Item::sep());
         v.push(cmd(app, "solid.press_pull", "Press Pull"));
         v.push(cmd(app, "inspect.measure", "Measure"));
@@ -555,11 +555,14 @@ fn viewport_items(app: &SolveApp) -> Vec<Item> {
         v.push(cmd(app, "solid.extrude", "Extrude"));
         v.push(cmd(app, "solid.revolve", "Revolve"));
     } else {
-        // Empty space, or a plane, which leads with a sketch on it.
-        if let Some(plane) = &app.menu.plane {
-            v.push(cmd(app, "sketch.create", "Create Sketch").with(json!({ "plane": plane })));
-            v.push(Item::sep());
-        }
+        // Empty space, or a plane: both lead with Create Sketch (#3032). On a plane it sketches
+        // there; on empty space it is the toolbar's, which asks for the plane or face.
+        let sketch = cmd(app, "sketch.create", "Create Sketch");
+        v.push(match &app.menu.plane {
+            Some(plane) => sketch.with(json!({ "plane": plane })),
+            None => sketch,
+        });
+        v.push(Item::sep());
         v.push(act("ui.nav", "Pan", "pan").with(json!({ "mode": "pan" })));
         v.push(act("ui.nav", "Zoom", "zoom").with(json!({ "mode": "zoom" })));
         v.push(act("ui.nav", "Orbit", "orbit").with(json!({ "mode": "orbit" })));
@@ -1076,22 +1079,25 @@ pub fn run_item(app: &mut SolveApp, item: &Item, at: Pos2) {
             }
         }
         "ui.hide" => {
-            for b in bodies {
-                if !app.session.visibility.hidden_bodies.contains(&b) {
-                    app.session.visibility.hidden_bodies.push(b);
-                }
-            }
+            // Through the command, so hiding is one undo step (#2219).
+            let _ = app.run("browser.visibility", json!({ "items": bodies, "visible": false }));
         }
-        "ui.show" => app.session.visibility.hidden_bodies.retain(|b| !bodies.contains(b)),
+        "ui.show" => {
+            let _ = app.run("browser.visibility", json!({ "items": bodies, "visible": true }));
+        }
         "ui.showAll" => {
-            let _ = app.run("browser.visibility", json!({"folder":"bodies", "visible":true}));
-            app.session.visibility.hidden_sketches.clear();
-            // Hidden folders and groups too, so everything really shows.
-            app.session.visibility.hidden_folders.clear();
+            // One command and so one undo step: everything shown, folders and placements included.
+            let _ = app.run("browser.visibility", json!({ "folder": "all", "visible": true }));
         }
         "ui.isolate" => {
-            app.session.visibility.hidden_bodies =
-                app.session.world_state().bodies.iter().map(|b| b.name.clone()).filter(|b| !bodies.contains(b)).collect();
+            // The picked bodies stay (shown first if they were hidden), everything else goes.
+            let others: Vec<String> = app.session.world_state().bodies.iter().map(|b| b.name.clone()).filter(|b| !bodies.contains(b)).collect();
+            if !bodies.is_empty() {
+                let _ = app.run("browser.visibility", json!({ "items": bodies, "visible": true }));
+            }
+            if !others.is_empty() {
+                let _ = app.run("browser.visibility", json!({ "items": others, "visible": false }));
+            }
         }
         "ui.lock" => {
             let locked = bodies.iter().all(|b| app.session.visibility.locked_bodies.contains(b));
@@ -1155,24 +1161,22 @@ pub fn run_item(app: &mut SolveApp, item: &Item, at: Pos2) {
             app.pick_save_command(&format!("{name}.step"), &["step", "stp", "igs", "stl", "3mf", "obj"], "file.export", json!({"bodies": bodies}));
         }
         "ui.findBrowser" => {
-            if let Some(feature) = id_of(&p, "feature") {
-                if let Some(body) = p.get("body").and_then(Value::as_str) {
-                    crate::browser::reveal_feature(app, feature, body);
-                }
-                return;
-            }
             if let Some(b) = p.get("body").and_then(Value::as_str) {
-                app.ui.show_browser = true;
-                app.preferences.timeline_left_browser_collapsed = false;
-                app.tree.reveal_feature = None;
-                app.tree.reveal = Some(b.to_string());
+                crate::browser::reveal_body(app, b);
                 let _ = app.run("select.set", json!({"items": [{"type": "body", "name": b}]}));
             }
         }
         "ui.findTimeline" => {
-            let f = id_of(&p, "feature").or_else(|| p.get("body").and_then(Value::as_str).and_then(|b| body_feature(app, b)));
+            let body = p.get("body").and_then(Value::as_str);
+            let f = id_of(&p, "feature").or_else(|| body.and_then(|b| body_feature(app, b)));
             if let Some(f) = f {
                 app.ui.show_timeline = true;
+                crate::timeline_left::reveal_feature(app, f);
+                // From a face or body, the Browser shows the feature in that body's copy. From a
+                // sketch, plane or feature row there is no body: that row is the Browser's view.
+                if let Some(body) = body {
+                    crate::browser::reveal_feature(app, f, body);
+                }
                 let _ = app.run("select.set", json!({"items": [{"type": "feature", "id": f}]}));
             }
         }
@@ -1291,15 +1295,13 @@ pub fn run_item(app: &mut SolveApp, item: &Item, at: Pos2) {
         }
         "ui.originAll" => {
             app.set_origin_shown(true);
-            app.session.visibility.hidden_origin.retain(|h| !["O", "X", "Y", "Z", "XY", "XZ", "YZ"].contains(&h.as_str()));
+            let _ = app.run("browser.visibility", json!({ "items": ["O", "X", "Y", "Z", "XY", "XZ", "YZ"], "visible": true }));
         }
         "ui.originPart" => {
             let show = p.get("show").and_then(Value::as_bool).unwrap_or(true);
-            for k in strs(&p, "keys") {
-                app.session.visibility.hidden_origin.retain(|h| *h != k);
-                if !show {
-                    app.session.visibility.hidden_origin.push(k);
-                }
+            let keys = strs(&p, "keys");
+            if !keys.is_empty() {
+                let _ = app.run("browser.visibility", json!({ "items": keys, "visible": show }));
             }
         }
         "ui.editFeature" => {
@@ -1431,14 +1433,13 @@ pub fn toggle_visibility(app: &mut SolveApp) {
         || origin.iter().any(|o| !app.session.visibility.hidden_origin.contains(o))
         || app.session.doc.canvases.iter().any(|c| canvases.contains(&c.id) && c.visible);
     let hide = any_visible;
-    app.session.visibility.hidden_bodies.retain(|b| !bodies.contains(b));
-    app.session.visibility.hidden_origin.retain(|o| !origin.contains(o));
-    if hide {
-        app.session.visibility.hidden_bodies.extend(bodies);
-        app.session.visibility.hidden_origin.extend(origin);
-    }
-    for s in sketches {
-        crate::browser::set_sketch_visible(app, s, !hide);
+    // One command for the picked bodies, construction items and sketches: the same step the
+    // menus run, so hiding from the viewport (V) is undone like any other hide (#2219).
+    let mut items: Vec<Value> = bodies.iter().map(|b| json!(b)).collect();
+    items.extend(origin.iter().map(|o| json!(o)));
+    items.extend(sketches.iter().map(|s| json!(s)));
+    if !items.is_empty() {
+        let _ = app.run("browser.visibility", json!({ "items": items, "visible": !hide }));
     }
     if !joints.is_empty() {
         let _ = app.run("browser.visibility", json!({ "joints": joints, "visible": !hide }));

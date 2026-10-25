@@ -1525,6 +1525,34 @@ fn the_first_dimension_does_not_scale_a_sketch_that_has_a_size() {
     assert!(out.get("scaled").is_none(), "{out}");
 }
 
+/// #3786: shapes that nothing links together are not one drawing: the first dimension sizes
+/// the shape it measures and leaves the other alone.
+#[test]
+fn the_first_dimension_leaves_a_separate_shape_alone() {
+    let mut s = new_sketch();
+    run(&mut s, "sketch.rectangle.two_point", json!({"p0": [0, 0], "p1": [20, 10]}));
+    run(&mut s, "sketch.rectangle.two_point", json!({"p0": [30, 10], "p1": [45, 20]}));
+    let other = sketch(&s);
+    let out = run(&mut s, "sketch.dimension", json!({"entities": ["l1"], "value": "30 mm", "scale_sketch": true}));
+    assert!(out.get("scaled").is_none(), "{out}");
+    let after = sketch(&s);
+    // The second rectangle (points 4..8, after the origin and the first rectangle's four) is untouched.
+    for (p, q) in other.points.iter().zip(&after.points).skip(5) {
+        assert!(q.pos.dist(p.pos) < 1e-6, "{} {:?} -> {:?}", p.id, p.pos, q.pos);
+    }
+}
+
+/// #1365 still holds for one drawing: shapes joined by a constraint scale together.
+#[test]
+fn the_first_dimension_scales_shapes_joined_by_a_constraint() {
+    let mut s = new_sketch();
+    run(&mut s, "sketch.rectangle.two_point", json!({"p0": [0, 0], "p1": [20, 10]}));
+    run(&mut s, "sketch.rectangle.two_point", json!({"p0": [30, 10], "p1": [45, 20]}));
+    run(&mut s, "sketch.constraint.coincident", json!({"a": "l1.start", "b": "l5.start"}));
+    let out = run(&mut s, "sketch.dimension", json!({"entities": ["l1"], "value": "40 mm", "scale_sketch": true}));
+    assert!(out.get("scaled").is_some(), "{out}");
+}
+
 /// The cursor fallback shares the held solves' frame budget; a scripted drag can finish later.
 #[test]
 fn cursor_fallback_respects_an_exhausted_live_frame_budget() {
@@ -1665,4 +1693,32 @@ fn cancel_refuses_once_undo_has_gone_back_past_where_the_sketch_was_opened() {
     let e = s.execute("sketch.cancel", &json!({})).unwrap_err().to_string();
     assert!(e.contains("Undo"), "{e}");
     assert_eq!(s.doc.to_json(), before, "nothing changed");
+}
+
+/// A line tangent to a free circle, one end dragged off the line: the other end stays where it
+/// is and the circle takes the change (it moved the far end, by 0.4 mm towards the dragged one
+/// for a 5 mm pull, though nothing needed it to).
+#[test]
+fn dragging_an_end_of_a_tangent_line_leaves_its_other_end_still() {
+    let mut s = new_sketch();
+    let c = run(&mut s, "sketch.circle.center", json!({"center": [0, 0], "radius": 10}))["curves"][0].as_str().unwrap().to_string();
+    let l = run(&mut s, "sketch.line", json!({"points": [[-20, 10], [20, 10]], "infer": false, "connect": false}))["curves"][0]
+        .as_str()
+        .unwrap()
+        .to_string();
+    run(&mut s, "sketch.constraint.tangent", json!({"a": l, "b": c}));
+    let at = |s: &Session, id: &str| {
+        let sk = sketch(s);
+        sk.resolve_point(id).and_then(|i| sk.point(i)).unwrap()
+    };
+    let start = at(&s, &format!("{l}.start"));
+    drag(&mut s, &format!("{l}.end"), [20.0, 10.0], [5.0, 12.0]);
+    assert!(at(&s, &format!("{l}.start")).dist(start) < 1e-7, "the far end moved: {:?}", at(&s, &format!("{l}.start")));
+    assert!(
+        at(&s, &format!("{l}.end")).dist(solidcraft_geom::Vec2::new(5.0, 12.0)) < 1e-6,
+        "the end went where dragged: {:?}",
+        at(&s, &format!("{l}.end"))
+    );
+    let si = run(&mut s, "sketch.inspect", json!({}));
+    assert!(si["failing"].as_array().is_some_and(Vec::is_empty), "still tangent: {si}");
 }

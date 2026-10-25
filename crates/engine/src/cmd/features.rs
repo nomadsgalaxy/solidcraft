@@ -25,7 +25,7 @@ pub static COMMANDS: &[CommandSpec] = &[
         .key("E")
         .contract(&EXTRUDE_CONTRACT)
         .output(output_schema_for::<FeatureResult>)
-        .params("distance: expr (or through_all: true); taper?: angle expr; sketch?: id|name (default: active or last sketch); profiles?: all | [index] | [{curves: [ids]}] (the profile whose outer loop is made of exactly these curves, or pieces of them; found again on every recompute, so it follows parameter changes; islands inside are its holes; an error when no profile or several match) | [{point:[x,y]}] (index and point picks are stored by their curves when that finds the same profile); default: every drawn profile, except that a loop inside another is its hole and a loop inside that hole is material again; face?: [x,y,z] (extrude a planar body face instead of a sketch profile); faces?: [[x,y,z],…] (coplanar faces of one body); face_body?: name (whose face, where faces of several bodies meet at the point); direction?: positive|negative|symmetric (distance is total thickness, split evenly around the start plane); convention?: total_distance|legacy_per_side (default total_distance; legacy preserves older symmetric extents); distance2?: expr (Two Sides: a second distance the other way from the first side, which may be through_all or to; with direction: negative the first side goes against the normal and distance2 along it); start_offset?: expr (along the sketch normal, also with direction: negative); to?: [x,y,z] (To Object: a face, vertex or point; to_offset?: expr past it); from?: [x,y,z] (From Object: start at that face or point); operation?: new|join|cut|intersect|auto (cut into a body, otherwise join existing solids; new in an empty component); targets?: [body] (Join from a face, or from a sketch on a body's face, defaults to that face's body; explicit targets or participants override); name?; body_name?; thin?: true (Thin: a wall along sketch curves instead of the profiles) with curves?: [curve ids] (open chains and closed loops, joined where they meet end to end; default: every drawn curve of the sketch), thickness: expr, side?: center|inside|outside|two_sides (a closed loop's inside is the area it encloses, an open chain's the side it bends toward, a straight line's the left of its first curve as drawn; default center), thickness2?: expr (two_sides: the thickness outside); corners are mitred, crossing walls are one"),
+        .params("distance: expr (or through_all: true); taper?: angle expr (positive: outward, so the far end is larger along the extrusion direction; negative: inward, so the far end is smaller); sketch?: id|name (default: active or last sketch); profiles?: all | [index] | [{curves: [ids]}] (the profile whose outer loop is made of exactly these curves, or pieces of them; found again on every recompute, so it follows parameter changes; islands inside are its holes; an error when no profile or several match) | [{point:[x,y]}] (index and point picks are stored by their curves when that finds the same profile); default: every drawn profile, except that a loop inside another is its hole and a loop inside that hole is material again; face?: [x,y,z] (extrude a planar body face instead of a sketch profile); faces?: [[x,y,z],…] (coplanar faces of one body); face_body?: name (whose face, where faces of several bodies meet at the point); direction?: positive|negative|symmetric (distance is total thickness, split evenly around the start plane); convention?: total_distance|legacy_per_side (default total_distance; legacy preserves older symmetric extents); distance2?: expr (Two Sides: a second distance the other way from the first side, which may be through_all or to; with direction: negative the first side goes against the normal and distance2 along it); start_offset?: expr (along the sketch normal, also with direction: negative); to?: [x,y,z] (To Object: a face, vertex or point; to_offset?: expr past it); from?: [x,y,z] (From Object: start at that face or point); operation?: new|join|cut|intersect|auto (cut into a body, otherwise join existing solids; new in an empty component); targets?: [body] (Join from a face, or from a sketch on a body's face, defaults to that face's body; explicit targets or participants override); name?; body_name?; thin?: true (Thin: a wall along sketch curves instead of the profiles) with curves?: [curve ids] (open chains and closed loops, joined where they meet end to end; default: every drawn curve of the sketch), thickness: expr, side?: center|inside|outside|two_sides (a closed loop's inside is the area it encloses, an open chain's the side it bends toward, a straight line's the left of its first curve as drawn; default center), thickness2?: expr (two_sides: the thickness outside); corners are mitred, crossing walls are one"),
     CommandSpec::new("solid.revolve", "Revolve", revolve)
         .at("SOLID", "CREATE")
         .icon("revolve")
@@ -564,11 +564,12 @@ fn add_feature_in(s: &mut Session, p: &Value, kind: FeatureKind, world: bool) ->
     // A cut or intersect made where the active component has no body of its own (a sketch in
     // the assembly's root, cutting through the parts, #1234) would have nothing to work on: it
     // takes part in every body instead, which it changes only where it meets them. An extrude's
-    // own operation counts too: an automatic one that came out as a cut (#3223).
+    // own operation counts too: an automatic one that came out as a cut (#3223); and so does a
+    // hole, which is always a cut (one at the points of a sketch on a nested part's face).
     let participants = if participants.is_empty()
         && !primitive
         && (matches!(str_(p, "operation").and_then(Operation::parse), Some(Operation::Cut | Operation::Intersect))
-            || matches!(&kind, FeatureKind::Extrude { operation: Operation::Cut | Operation::Intersect, .. }))
+            || matches!(&kind, FeatureKind::Extrude { operation: Operation::Cut | Operation::Intersect, .. } | FeatureKind::Hole { .. }))
         && s.cut_takes_every_body(&s.model.state())
     {
         vec!["*".to_string()]
@@ -771,6 +772,16 @@ fn sketch_face_body(s: &Session, sketch: u64) -> Option<String> {
     active_scope(s, &st).into_iter().find(|b| b.name == anchor.target.body).map(|b| b.name.clone())
 }
 
+/// The bodies a Join named none for: the body whose face a profile sketch is on (the first
+/// sketch that is on one), as for an extrude. Explicit `targets` or `participants` keep theirs.
+fn face_join_targets(s: &Session, p: &Value, operation: Operation, sketches: &[u64]) -> Vec<BodyName> {
+    let mut targets = string_list(p, "targets");
+    if operation == Operation::Join && targets.is_empty() && string_list(p, "participants").is_empty() {
+        targets.extend(sketches.iter().find_map(|sk| sketch_face_body(s, *sk)));
+    }
+    targets.into_iter().map(BodyName).collect()
+}
+
 /// The bodies a feature of the active component works on when it names none: the component's
 /// own. A component with no body of its own (the root of an opened STEP assembly, whose parts
 /// are components inside it) works on the bodies of the components inside it whose geometry is
@@ -935,13 +946,14 @@ fn revolve(s: &mut Session, p: &Value) -> Result<Value> {
         None => solidcraft_doc::RevolveConvention::SketchNormal,
         Some(value) => serde_json::from_value(value.clone()).map_err(|_| bad(cmd, "`convention` must be sketch_normal or legacy_axis_start"))?,
     };
+    let operation = operation(p, cmd)?;
     let kind = FeatureKind::Revolve {
         sketch: SketchId(sketch),
         profiles,
         axis,
         angle,
-        operation: operation(p, cmd)?,
-        targets: string_list(p, "targets").into_iter().map(BodyName).collect(),
+        operation,
+        targets: face_join_targets(s, p, operation, &[sketch]),
         angle2,
         symmetric,
         convention,
@@ -2189,6 +2201,8 @@ fn sweep(s: &mut Session, p: &Value) -> Result<Value> {
     }
     let (orientation, twist, scale) = sweep_options(s, p, cmd)?;
     let (rails, rail_fit) = sweep_rails(s, p, cmd, path_sketch)?;
+    let operation = operation(p, cmd)?;
+    let targets = face_join_targets(s, p, operation, &[sketch]);
     add_feature(
         s,
         p,
@@ -2202,8 +2216,8 @@ fn sweep(s: &mut Session, p: &Value) -> Result<Value> {
             scale,
             rails,
             rail_fit,
-            operation: operation(p, cmd)?,
-            targets: string_list(p, "targets").into_iter().map(BodyName).collect(),
+            operation,
+            targets,
         },
     )
 }
@@ -2324,17 +2338,10 @@ fn loft(s: &mut Session, p: &Value) -> Result<Value> {
         sections.push(solidcraft_doc::LoftSection { sketch: SketchId(sketch), profiles: profiles(sec, cmd)?, point: None });
     }
     let (rails, rail_fit) = guide_rails(s, p, cmd, "loft", None)?;
-    add_feature(
-        s,
-        p,
-        FeatureKind::Loft {
-            sections,
-            operation: operation(p, cmd)?,
-            targets: string_list(p, "targets").into_iter().map(BodyName).collect(),
-            rails,
-            rail_fit,
-        },
-    )
+    let operation = operation(p, cmd)?;
+    let sketches: Vec<u64> = sections.iter().map(|sec| sec.sketch.0).collect();
+    let targets = face_join_targets(s, p, operation, &sketches);
+    add_feature(s, p, FeatureKind::Loft { sections, operation, targets, rails, rail_fit })
 }
 
 fn thread(s: &mut Session, p: &Value) -> Result<Value> {

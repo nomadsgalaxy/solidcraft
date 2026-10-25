@@ -736,6 +736,9 @@ impl ModelState {
 /// Model after some prefix of the timeline.
 #[derive(Clone, Debug, Default)]
 pub struct ModelState {
+    /// Frame placements belong to the evaluator. A weak reference avoids a cycle through
+    /// cached bodies' naming origins, which retain earlier model states.
+    frame_bodies: std::sync::Weak<std::sync::Mutex<FrameBodies>>,
     /// Cosmetic threads (from Thread features and threaded holes).
     pub threads: Vec<ThreadInfo>,
     pub bodies: Vec<ModelBody>,
@@ -767,6 +770,31 @@ pub struct ModelState {
 }
 
 impl ModelState {
+    /// `body` moved by `matrix` into a feature's frame. The evaluator that made this state keeps
+    /// the moved body, so an unchanged body under an unchanged placement is moved (and meshed)
+    /// once rather than on every evaluation.
+    pub(crate) fn body_in_frame(&self, body: &ModelBody, matrix: &Mat) -> Result<ModelBody> {
+        if crate::is_identity(matrix) {
+            return Ok(body.clone());
+        }
+        let cache = self.frame_bodies.upgrade();
+        // Not held while the body is moved: copies of the evaluator may share the cache.
+        let reused = cache.as_ref().and_then(|c| c.lock().unwrap_or_else(|e| e.into_inner()).reused(body, matrix));
+        let placed = match reused {
+            Some(placed) => placed,
+            None => {
+                let placed = ModelBody::new(body.name.clone(), kernel::transform_matrix(&body.body, *matrix)?, body.feature);
+                #[cfg(test)]
+                cost_tests::count(|c| c.moved += 1);
+                if let Some(c) = &cache {
+                    c.lock().unwrap_or_else(|e| e.into_inner()).keep(body, matrix, &placed);
+                }
+                placed
+            }
+        };
+        Ok(in_frame(body, matrix, &placed))
+    }
+
     /// A digest of everything later features can read: bodies (by content identity), sketches,
     /// the body counter, threads and sheet bodies.
     fn digest(&self) -> u64 {
@@ -1088,6 +1116,8 @@ pub struct Model {
     /// Results another copy of this model evaluated (ahead, off the window thread) that
     /// `evaluate` takes for features they match ([`Model::prime`]), with that copy's context.
     primed: Option<(u64, Arc<std::collections::HashMap<u64, FeatureResult>>)>,
+    /// Shared with copies of this evaluator; states hold only a weak reference.
+    frame_bodies: Arc<std::sync::Mutex<FrameBodies>>,
 }
 
 /// Parameters a feature uses directly (inputs, sketch dimensions and the expressions of a
@@ -1798,6 +1828,7 @@ impl Model {
     pub fn evaluate(&mut self, doc: &Document) {
         let (vals, perr) = evaluation_values(doc);
         self.param_errors = perr;
+        self.frame_bodies.lock().unwrap_or_else(|e| e.into_inner()).next_generation();
         let mut prev_fp = 0u64;
         // The names the design must not use again travel with the state (#4957).
         let mut state = std::sync::Arc::new(ModelState { reserved_body_names: doc.reserved_body_names.clone(), ..(*self.empty).clone() });
@@ -1909,6 +1940,7 @@ impl Model {
             let mut next = (*state).clone();
             // The names the design must not use again travel with the state (#4957, #4302).
             next.reserved_body_names.clone_from(&reserved);
+            next.frame_bodies = Arc::downgrade(&self.frame_bodies);
             for b in &mut next.bodies {
                 b.made = crate::lineage::Made::Before;
             }
@@ -4438,8 +4470,25 @@ fn feature_tools_with_constructor(
                         // A start that can't run on (the profile hangs over the face's edge):
                         // the sides stand straight for a hair first, so the boolean can push the
                         // face the tool stands on into the body.
-                        let foot = if a >= 0.0 && on_face { TAPER_FOOT.min((b - a) * 0.01) } else { 0.0 };
-                        let body = kernel::extrude_tapered_between(&start_plane, r, a, b, foot, sign, taper)?;
+                        let build = |a: f64| {
+                            let foot = if a >= 0.0 && on_face { TAPER_FOOT.min((b - a) * 0.01) } else { 0.0 };
+                            kernel::extrude_tapered_between(&start_plane, r, a, b, foot, sign, taper)
+                        };
+                        let mut body = build(a);
+                        // A taper that widens the tool where it cuts narrows it behind its start, so
+                        // the run on can close a small corner arc the tool itself never shrinks
+                        // (#4825): run on less, then start on the face.
+                        for k in [0.5, 0.25, 0.0] {
+                            if body.is_ok() || a >= 0.0 {
+                                break;
+                            }
+                            let shorter = build(a * k);
+                            if shorter.is_ok() {
+                                a *= k;
+                                body = shorter;
+                            }
+                        }
+                        let body = body?;
                         growth = growth.max(a.abs().max(b.abs()) * taper.tan().abs());
                         Ok(roles.tool(body, None))
                     })
@@ -4849,15 +4898,44 @@ fn feature_tools_with_constructor(
             // Its sides are named by the profile's curves, its base `start`.
             Ok(vec![crate::lineage::ProfileRoles::swept(Some(ss), Some(r)).tool(body, None)])
         }
-        FeatureKind::Coil { base, axis, diameter, pitch, turns, section_size, section, position, start_angle, clockwise, .. } => {
+        FeatureKind::Coil {
+            base, axis, diameter, pitch, turns, section_size, section, position, start_angle, clockwise, sketch, profiles, ..
+        } => {
             let base = &point(vals, base)?;
             let k = axis.normalized().ok_or_else(|| DocError::Invalid("coil axis".into()))?;
-            let (d, p, n, s) = (
-                val(vals, diameter, Kind::Length)?,
-                val(vals, pitch, Kind::Length)?,
-                val(vals, turns, Kind::Unitless)?,
-                val(vals, section_size, Kind::Length)?,
-            );
+            let p = val(vals, pitch, Kind::Length)?;
+            let n = val(vals, turns, Kind::Unitless)?;
+            if sketch.is_some()
+                && (diameter.is_some()
+                    || section_size.is_some()
+                    || start_angle.is_some()
+                    || !matches!(section, crate::CoilSection::Circular)
+                    || *position != 0)
+            {
+                return Err(DocError::Invalid(
+                    "a coil with a `sketch` cannot also set `diameter`, `section_size`, `section`, `section_position` or `start_angle`".into(),
+                ));
+            }
+            if sketch.is_none() && !matches!(profiles, ProfileSel::All) {
+                return Err(DocError::Invalid("a coil's `profiles` need a `sketch`".into()));
+            }
+            if let Some(sk) = sketch {
+                let ss = st.sketch(sk.0).ok_or_else(|| DocError::Unknown(format!("sketch {sk} (it must come earlier in the timeline)")))?;
+                let regions = select_profiles(ss, profiles)?;
+                if regions.iter().any(|r| !r.holes.is_empty()) {
+                    return Err(DocError::Invalid("a coil from a sketch takes a profile without holes".into()));
+                }
+                let [region] = &regions[..] else {
+                    return Err(DocError::Invalid(format!("a coil from a sketch takes one closed profile (the sketch has {})", regions.len())));
+                };
+                let axis = if *clockwise { k * -1.0 } else { k };
+                // A left-handed coil turns about −axis and climbs along +axis: mirror the pitch.
+                let pitch = if *clockwise { -p } else { p };
+                return Ok(unnamed(vec![kernel::sweep_helix(&ss.plane, region, *base, axis, pitch, n)?]));
+            }
+            let diameter = diameter.as_ref().ok_or_else(|| DocError::Invalid("a coil needs a `sketch` or a `diameter`".into()))?;
+            let section_size = section_size.as_ref().ok_or_else(|| DocError::Invalid("a coil needs a `sketch` or a `section_size`".into()))?;
+            let (d, s) = (val(vals, diameter, Kind::Length)?, val(vals, section_size, Kind::Length)?);
             if !(d > 0.0 && s > 0.0 && n > 0.0) {
                 return Err(DocError::Invalid("the coil diameter, section size and revolutions must be positive".into()));
             }
@@ -5701,8 +5779,13 @@ fn replay(
             format!("{list} suppressed and not copied")
         });
     }
+    // The copies are made in timeline order, whatever order the features were picked in: a
+    // chamfer picked before the hole it blends would otherwise find no edge to copy.
+    let mut kept: Vec<String> = features.iter().filter(|n| !suppressed.contains(n)).cloned().collect();
+    let at = |name: &String| source_feature(doc, name).ok().and_then(|f| doc.features.iter().position(|x| std::ptr::eq(x, f))).unwrap_or(usize::MAX);
+    kept.sort_by_key(at);
+    kept.dedup();
     let (mut missed, mut total) = (0usize, 0usize);
-    let kept: Vec<String> = features.iter().filter(|n| !suppressed.contains(n)).cloned().collect();
     let plan = copy_plan(doc, vals, st, &kept, mats)?;
     for (src, mats, first) in &plan {
         // A fillet or chamfer repeats at the copied edges.
@@ -7281,20 +7364,9 @@ pub fn state_in_frame_at<'a>(doc: &Document, st: &'a ModelState, comp: u64, fram
     let mut out = st.clone();
     for (b, m) in out.bodies.iter_mut().zip(&body_m) {
         if !crate::is_identity(m)
-            && let Ok(t) = kernel::transform_matrix(&b.body, *m)
+            && let Ok(moved) = st.body_in_frame(b, m)
         {
-            #[cfg(test)]
-            cost_tests::count(|c| c.moved += 1);
-            // Moving a body keeps its faces (and their order): it keeps their names.
-            let names = crate::naming::NameCell::same(b);
-            let mut nb = ModelBody::new(b.name.clone(), t, b.feature);
-            nb.component = b.component;
-            nb.transferred = b.transferred;
-            nb.source_name = b.source_name.clone();
-            nb.source_transform = crate::mat_mul(m, &b.source_transform);
-            nb.imported = b.imported.clone();
-            nb.names = names;
-            *b = nb;
+            *b = moved;
         }
     }
     for (s, m) in out.sketches.iter_mut().zip(&sketch_m) {
@@ -7329,27 +7401,33 @@ pub fn world_state(doc: &Document, st: &ModelState) -> ModelState {
 /// definition and placement are unchanged instead of transforming it again, and so keeps its
 /// display mesh. Without this every change anywhere in a design transformed and meshed every
 /// body of every moved component again.
-#[derive(Default)]
+#[derive(Debug, Default)]
 pub struct PlacedBodies {
     by_source: std::collections::HashMap<(usize, [u64; 16]), (ModelBody, ModelBody)>,
 }
 
 impl PlacedBodies {
+    fn reused(&self, b: &ModelBody, m: &crate::Mat) -> Option<&ModelBody> {
+        self.by_source
+            .get(&placed_key(b, m))
+            .filter(|(source, _)| {
+                Arc::ptr_eq(&source.mesh, &b.mesh)
+                    && source.body.same(&b.body)
+                    && source.body.color() == b.body.color()
+                    && source.body.paint() == b.body.paint()
+                    && match (source.body.split_lines(), b.body.split_lines()) {
+                        (Some(x), Some(y)) => Arc::ptr_eq(x, y),
+                        (None, None) => true,
+                        _ => false,
+                    }
+            })
+            .map(|(_, placed)| placed)
+    }
+
     /// The body `b` placed by `m`, from an earlier call when `b` is the same body as then.
     fn placed(&self, b: &ModelBody, m: &crate::Mat, name: String) -> ModelBody {
-        let reused = self.by_source.get(&placed_key(b, m)).filter(|(source, _)| {
-            Arc::ptr_eq(&source.mesh, &b.mesh)
-                && source.body.same(&b.body)
-                && source.body.color() == b.body.color()
-                && source.body.paint() == b.body.paint()
-                && match (source.body.split_lines(), b.body.split_lines()) {
-                    (Some(x), Some(y)) => Arc::ptr_eq(x, y),
-                    (None, None) => true,
-                    _ => false,
-                }
-        });
-        match reused {
-            Some((_, placed)) => {
+        match self.reused(b, m) {
+            Some(placed) => {
                 let mut fresh = ModelBody::new(name, placed.body.clone(), b.feature);
                 fresh.mesh = placed.mesh.clone();
                 fresh.mesh_placement = placed.mesh_placement.clone();
@@ -7367,6 +7445,66 @@ impl PlacedBodies {
             },
         }
     }
+}
+
+/// Bodies [`state_in_frame_at`] moved into a feature's frame, by source body and matrix: a
+/// sketch on a face of a turned component is evaluated in that component's frame, and without
+/// this every edit of it moved (and so meshed again) every body placed differently from it.
+/// Held by the [`Model`] across evaluations; each `evaluate` starts a new generation, and an
+/// entry neither it nor the evaluation before it used is dropped, so the cache holds only the
+/// placements in use.
+#[derive(Debug, Default)]
+pub(crate) struct FrameBodies {
+    now: PlacedBodies,
+    before: PlacedBodies,
+}
+
+impl FrameBodies {
+    /// At most this many bodies are kept per generation.
+    const CAP: usize = 4096;
+
+    pub(crate) fn next_generation(&mut self) {
+        self.before = std::mem::take(&mut self.now);
+    }
+
+    /// The moved body for `b` under `m`, when a call in this or the previous generation moved
+    /// the same body by the same matrix.
+    fn reused(&mut self, b: &ModelBody, m: &crate::Mat) -> Option<ModelBody> {
+        if let Some(placed) = self.now.reused(b, m) {
+            return Some(placed.clone());
+        }
+        let placed = self.before.reused(b, m)?.clone();
+        let key = placed_key(b, m);
+        if let Some(entry) = self.before.by_source.remove(&key)
+            && self.now.by_source.len() < Self::CAP
+        {
+            self.now.by_source.insert(key, entry);
+        }
+        Some(placed)
+    }
+
+    fn keep(&mut self, b: &ModelBody, m: &crate::Mat, moved: &ModelBody) {
+        if self.now.by_source.len() < Self::CAP {
+            self.now.by_source.insert(placed_key(b, m), (b.clone(), moved.clone()));
+        }
+    }
+}
+
+/// `b` in a feature's frame: `placed` (its geometry moved by `m`, sharing the moved body's
+/// mesh and display plan), carrying `b`'s ownership and naming.
+fn in_frame(b: &ModelBody, m: &crate::Mat, placed: &ModelBody) -> ModelBody {
+    let mut moved = ModelBody::new(b.name.clone(), placed.body.clone(), b.feature);
+    moved.mesh = placed.mesh.clone();
+    moved.plan = placed.plan.clone();
+    moved.plan_mesh = placed.plan_mesh.clone();
+    moved.component = b.component;
+    moved.transferred = b.transferred;
+    moved.source_name = b.source_name.clone();
+    moved.source_transform = crate::mat_mul(m, &b.source_transform);
+    moved.imported = b.imported.clone();
+    // Moving a body keeps its faces (and their order): it keeps their names.
+    moved.names = crate::naming::NameCell::same(b);
+    moved
 }
 
 fn placed_key(b: &ModelBody, m: &crate::Mat) -> (usize, [u64; 16]) {
