@@ -27,6 +27,8 @@ use crate::theme::Tokens;
 const FORMATS: [(&str, &str, &str); 3] = [("STL", "stl", "stl"), ("3MF", "3mf", "3mf"), ("3MF with face tags", "3mf-tagged", "3mf")];
 /// The list key of the EasyPrint row (no slicer has it: ids are words, programs are paths).
 const EASYPRINT: &str = "easyprint";
+/// How closely the mesh follows curved faces (#4747): the label and `file.save_mesh`'s `quality`.
+const QUALITIES: [(&str, &str); 3] = [("Standard", "standard"), ("Fine", "fine"), ("Finest", "finest")];
 /// Edge of a slicer's icon in the list.
 const ICON: f32 = 16.0;
 /// Most programs the user can keep in the list.
@@ -38,6 +40,8 @@ pub struct SaveMesh {
     format: usize,
     /// Send to Slicer: only the bodies and the slicer are asked.
     open: bool,
+    /// Index into [`QUALITIES`] (Save As Mesh; Send to Slicer has no quality row).
+    quality: usize,
     /// The chosen slicer: an installed one's id, or the path of one the user added.
     slicer: String,
     /// The slicer list has not been read for this opening yet.
@@ -122,7 +126,8 @@ pub fn start(app: &SolveApp, id: &str) -> Option<(Kind, Vec<SelInput>)> {
         _ if open => p.send_slicer.clone(),
         _ => String::new(),
     };
-    let kind = Kind::SaveMesh(SaveMesh { format, open, slicer, stale: true });
+    let quality = QUALITIES.iter().position(|q| q.1 == p.save_mesh_quality).unwrap_or(0);
+    let kind = Kind::SaveMesh(SaveMesh { format, quality, open, slicer, stale: true });
     Some((kind, vec![SelInput::new("Bodies", BODIES, true)]))
 }
 
@@ -301,6 +306,7 @@ fn paint_icon(ui: &egui::Ui, rect: egui::Rect, tex: Option<egui::TextureId>, nam
 pub fn rows(app: &mut SolveApp, ui: &mut egui::Ui, k: &mut SaveMesh) -> bool {
     if !k.open {
         choice_row(ui, "Format", "sm_format", &mut k.format, &FORMATS.map(|f| f.0));
+        choice_row(ui, "Quality", "sm_quality", &mut k.quality, &QUALITIES.map(|q| q.0));
         return false;
     }
     if k.stale {
@@ -465,6 +471,10 @@ fn add_custom(app: &mut SolveApp, path: &str) -> Result<(), String> {
 pub fn commands(k: &SaveMesh, inputs: &[SelInput]) -> Result<Vec<(String, Value)>, String> {
     let format = FORMATS.get(k.format).map_or("stl", |f| f.1);
     let mut p = json!({ "format": format });
+    // Standard is the command's own default, so it is left out. Sending has no quality row.
+    if let Some((_, quality)) = QUALITIES.get(k.quality).filter(|_| k.quality > 0 && !k.open) {
+        p["quality"] = json!(quality);
+    }
     let names = crate::selection::items(inputs, 0).body_names();
     if names.is_empty() {
         return Err(crate::i18n::tr("ui.save_mesh_pick_bodies").into());
@@ -515,6 +525,7 @@ pub fn run(app: &mut SolveApp, k: &SaveMesh, inputs: &[SelInput]) -> Result<(), 
     let (format, ext) = FORMATS.get(k.format).map_or(("stl", "stl"), |f| (f.1, f.2));
     let name = crate::selection::items(inputs, 0).body_names().first().cloned().unwrap_or_else(|| app.session.doc.name.clone());
     app.preferences.save_mesh_format = format.into();
+    app.preferences.save_mesh_quality = QUALITIES.get(k.quality).map_or("standard", |q| q.1).into();
     // The file dialog answers later; the dialog closes meanwhile, as for every export.
     app.pick_save(&format!("{name}.{ext}"), &[ext], move |app, path| {
         if let Some(path) = path {
@@ -850,7 +861,7 @@ mod tests {
 
     #[test]
     fn send_to_slicer_asks_for_bodies_and_a_slicer_but_not_a_format() {
-        let k = SaveMesh { format: 0, open: true, slicer: "prusa".into(), stale: false };
+        let k = SaveMesh { format: 0, quality: 0, open: true, slicer: "prusa".into(), stale: false };
         let mut input = SelInput::new("Bodies", BODIES, true);
         assert!(commands(&k, std::slice::from_ref(&input)).is_err());
         input.items = vec![Sel::Body { name: "Part".into() }];
@@ -863,5 +874,16 @@ mod tests {
         assert_eq!(button(&save), "Save");
         assert_eq!(button(&k), "Send");
         assert!(commands(&SaveMesh { slicer: String::new(), ..k }, &[input]).is_err());
+    }
+
+    #[test]
+    fn a_remembered_quality_goes_to_save_but_not_to_send() {
+        let mut input = SelInput::new("Bodies", BODIES, true);
+        input.items = vec![Sel::Body { name: "Part".into() }];
+        let k = SaveMesh { format: 0, quality: 2, open: true, slicer: "prusa".into(), stale: false };
+        let (_, sent) = commands(&k, std::slice::from_ref(&input)).unwrap().remove(0);
+        assert_eq!(sent.get("quality"), None, "sending has no quality row: the default applies");
+        let (_, saved) = commands(&SaveMesh { open: false, ..k }, &[input]).unwrap().remove(0);
+        assert_eq!(saved["quality"], "finest");
     }
 }

@@ -674,6 +674,8 @@ pub struct Tokens {
     /// Sketch curves: under-constrained, fully constrained (and finished sketches).
     pub sketch: Color32,
     pub sketch_fixed: Color32,
+    /// Wider rim beneath sketch curves to separate them from shaded faces.
+    pub sketch_halo: Color32,
     /// Fixed (locked) sketch geometry.
     pub sketch_locked: Color32,
     /// Sketch dimensions: driving, driven (reference).
@@ -1009,6 +1011,23 @@ mod tests {
             let [color, ink, soft] = values.map(rgb);
             assert_eq!(super::TabAccent::for_tab(&t, "MODEL"), super::TabAccent { color, ink, soft });
         }
+    }
+
+    #[test]
+    fn built_in_selected_tab_labels_hold_wcag_small_text_contrast() {
+        let mut themes = vec![("Dark", super::Tokens::dark()), ("Light", super::Tokens::light())];
+        themes.extend(crate::theme_files::builtin().iter().map(|theme| (theme.name.as_str(), crate::theme_files::resolve(theme))));
+        let mut failures = Vec::new();
+        for (name, tokens) in themes {
+            for tab in crate::workspace::TABS.iter().copied().chain(["SKETCH", "MESH", "FORM", "SHEET METAL", "RENDER"]) {
+                let accent = super::TabAccent::for_tab(&tokens, tab);
+                let ratio = super::contrast_ratio(accent.ink, accent.soft);
+                if ratio < 4.5 {
+                    failures.push(format!("{name} {tab}: {ratio:.4}:1 ({:?} on {:?})", accent.ink, accent.soft));
+                }
+            }
+        }
+        assert!(failures.is_empty(), "selected tab contrast below 4.5:1:\n{}", failures.join("\n"));
     }
 
     #[test]

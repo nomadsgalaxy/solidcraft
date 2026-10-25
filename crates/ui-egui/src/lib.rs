@@ -360,6 +360,8 @@ pub struct Services {
     pub graphics_path: Option<String>,
     /// Linux: the window system this run uses, `wayland` or `x11` (Preferences shows it, #3083).
     pub window_system: Option<&'static str>,
+    /// Adapter names and descriptive labels from the desktop renderer's chosen backends.
+    pub graphics_adapters: Vec<(String, String)>,
     /// HTTPS GET for the update check (`update`); None: never check (browser, tests).
     pub http_get: Option<update::HttpGet>,
     /// HTTPS download to a file, with progress, for one-click updates (`update::install`).
@@ -1110,6 +1112,12 @@ impl SolveApp {
             self.pick_open_command(id, json!({}), &[ext]);
             return;
         }
+        if id == "component.update_links" && !self.session.doc.links.is_empty() {
+            // Reading the linked designs again takes a while in a large assembly: off the window
+            // thread, the overlay naming the one being read (#5329).
+            let _ = file_load::begin_request(self, file_load::Request::new("", file_load::Kind::UpdateLinks));
+            return;
+        }
         if id == "component.insert_design" {
             // Another design becomes a linked component; a STEP or mesh file picked here is
             // inserted the way Insert STEP or Insert Mesh would (#1240).
@@ -1231,7 +1239,7 @@ impl SolveApp {
                     | "sketch.constraint.tangent"
                     | "sketch.constraint.concentric"
                     | "sketch.constraint.collinear"
-            ) && let [solidcraft_engine::Sel::SketchCurve { id: a }, solidcraft_engine::Sel::SketchCurve { id: b }] =
+            ) && let [solidcraft_engine::Sel::SketchCurve { id: a, .. }, solidcraft_engine::Sel::SketchCurve { id: b, .. }] =
                 self.session.selection.as_slice()
                 && a != b
             {
@@ -1248,7 +1256,7 @@ impl SolveApp {
                     .selection
                     .iter()
                     .filter_map(|s| match s {
-                        solidcraft_engine::Sel::SketchCurve { id } | solidcraft_engine::Sel::SketchPoint { id } => Some(id.clone()),
+                        solidcraft_engine::Sel::SketchCurve { id, .. } | solidcraft_engine::Sel::SketchPoint { id } => Some(id.clone()),
                         _ => None,
                     })
                     .take(2)

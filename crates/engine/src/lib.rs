@@ -13,6 +13,7 @@ pub mod capture;
 pub mod cmd;
 pub mod control_auth;
 pub mod control_pending;
+pub mod cosmetic_threads;
 pub mod crash;
 pub mod easyprint;
 pub mod frames;
@@ -116,9 +117,12 @@ pub enum Sel {
     Feature {
         id: u64,
     },
-    /// A sketch curve or point (by id) of the active sketch.
+    /// A sketch curve or point (by id) of the active sketch. A curve picked into a dialog also
+    /// names its `sketch`: curve ids repeat from one sketch to the next (#3726).
     SketchCurve {
         id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        sketch: Option<u64>,
     },
     SketchPoint {
         id: String,
