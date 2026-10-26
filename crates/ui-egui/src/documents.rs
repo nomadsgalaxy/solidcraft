@@ -26,6 +26,7 @@ pub struct DocSlot {
     cam: Camera,
     pre_sketch_marker: Option<Option<usize>>,
     pub(crate) pending_feature_edit: Option<crate::feature_edit::PendingFeatureEdit>,
+    pre_sketch_cam: Option<crate::PreSketchView>,
     view: DocView,
     occurrence_move: Option<crate::browser::OccMove>,
     agent_chat: crate::agent_chat::AgentChat,
@@ -47,6 +48,7 @@ impl DocSlot {
             cam: Camera::default(),
             pre_sketch_marker: None,
             pending_feature_edit: None,
+            pre_sketch_cam: None,
             view: DocView::default(),
             occurrence_move: None,
             agent_chat: Default::default(),
@@ -129,6 +131,7 @@ fn swap_in(app: &mut SolveApp, mut slot: DocSlot) -> DocSlot {
         cam: std::mem::replace(&mut app.cam, slot.cam),
         pre_sketch_marker: std::mem::replace(&mut app.pre_sketch_marker, slot.pre_sketch_marker),
         pending_feature_edit: std::mem::replace(&mut app.pending_feature_edit, slot.pending_feature_edit),
+        pre_sketch_cam: std::mem::replace(&mut app.pre_sketch_cam, slot.pre_sketch_cam),
         view: take_view(app),
         occurrence_move: std::mem::replace(&mut app.tree.occurrence_move, slot.occurrence_move),
         agent_chat: slot.agent_chat,
@@ -1099,9 +1102,11 @@ mod tests {
         assert_eq!(tab_tooltip("a-long-name", Some("/srv/a-long-name.solidcraft"), true), "a-long-name\n/srv/a-long-name.solidcraft");
         assert_eq!(tab_tooltip("Untitled", None, false), "Not saved yet");
         assert_eq!(tab_tooltip("Untitled", None, true), "Untitled\nNot saved yet");
-        if let Some(home) = std::env::var_os("HOME").filter(|h| !h.is_empty()) {
-            let path = std::path::Path::new(&home).join("Designs").join("bracket.solidcraft");
-            assert_eq!(tab_tooltip("bracket", path.to_str(), false), "~/Designs/bracket.solidcraft");
+        if let Some(home) = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")).filter(|h| !h.is_empty()) {
+            // The abbreviation keeps the relative path's native separators after `~/`.
+            let relative = std::path::Path::new("Designs").join("bracket.solidcraft");
+            let path = std::path::Path::new(&home).join(&relative);
+            assert_eq!(tab_tooltip("bracket", path.to_str(), false), format!("~/{}", relative.display()));
         }
     }
 

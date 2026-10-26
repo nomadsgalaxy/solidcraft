@@ -10,7 +10,9 @@ use serde_json::{Value, json};
 use solidcraft_engine::Sel;
 use solidcraft_engine::Session;
 use solidcraft_engine::doc::expr::Kind as ValueKind;
-use solidcraft_engine::doc::{AxisRef, Direction, FeatureKind, FilletStyle, HoleKind, Operation, PatternKind, PlaneRef, ProfileSel, ThinSide};
+use solidcraft_engine::doc::{
+    AxisRef, Direction, FeatureKind, FilletStyle, HoleKind, Operation, PatternKind, PlaneRef, ProfileSel, ThinSide, ThreadHandedness,
+};
 use solidcraft_engine::geom::{Aabb3, Vec3};
 
 use crate::SolveApp;
@@ -237,6 +239,7 @@ crate::dialog_descriptor::dialog_descriptors! {
             Thread {
                 designation: String,
                 length: String,
+                handedness: ThreadHandedness,
                 /// The last automatic size; a different value is a manual override. Keep automatic
                 /// features automatic when applying, even though their resolved size is visible.
                 suggested: Option<String>,
@@ -411,6 +414,7 @@ pub struct HoleOpts {
     /// Use the full useful cylindrical wall, independently of the drill extents.
     pub thread_full_depth: bool,
     pub thread_depth: String,
+    pub handedness: ThreadHandedness,
 }
 
 impl Default for HoleOpts {
@@ -426,6 +430,7 @@ impl Default for HoleOpts {
             refs: Default::default(),
             thread_full_depth: true,
             thread_depth: "10 mm".into(),
+            handedness: ThreadHandedness::Right,
         }
     }
 }
@@ -826,7 +831,13 @@ impl Dialog {
                 vec![SelInput::new("Body to split", BODIES, false), SelInput::new("Splitting tool", PLANES | FACES | AXES, false)],
             ),
             "solid.thread" => Dialog::new(
-                Kind::Thread { designation: String::new(), length: String::new(), suggested: None, of: Vec::new() },
+                Kind::Thread {
+                    designation: String::new(),
+                    length: String::new(),
+                    handedness: ThreadHandedness::Right,
+                    suggested: None,
+                    of: Vec::new(),
+                },
                 vec![SelInput::new("Cylindrical face", FACES, false)],
             ),
             "material.assign" => Dialog::new(Kind::Material { index: 1, editor: Default::default() }, vec![SelInput::new("Bodies", BODIES, true)]),
@@ -2497,9 +2508,11 @@ pub enum Shown {
     Max,
 }
 
-fn vec3_of(v: &Value) -> Option<Vec3> {
+/// A finite `[x, y, z]` of plain numbers.
+pub(crate) fn vec3_of(v: &Value) -> Option<Vec3> {
     let a = v.as_array()?;
-    Some(Vec3::new(a.first()?.as_f64()?, a.get(1)?.as_f64()?, a.get(2)?.as_f64()?))
+    let p = Vec3::new(a.first()?.as_f64()?, a.get(1)?.as_f64()?, a.get(2)?.as_f64()?);
+    p.is_finite().then_some(p)
 }
 
 /// The distance shown for a measured pair: which one, its value and its two ends. The chosen
@@ -2801,6 +2814,7 @@ pub fn show(app: &mut SolveApp, ctx: &egui::Context) {
             }
             let body = |ui: &mut egui::Ui| {
                 d.sync_fillet_chain(&app.session);
+                crate::hole_presets::rows(ui, &mut d, &mut app.preferences.hole_presets, &app.session.doc, reset_scroll);
                 let (accepted, fields) = crate::ui_kit::value_fields(ctx, || dense::rows(app, ctx, &mut d, ui));
                 enter |= accepted;
                 value_fields = fields;
@@ -2884,6 +2898,12 @@ pub fn show(app: &mut SolveApp, ctx: &egui::Context) {
     } else {
         d.value_focus = ctx.memory(|memory| memory.focused()).filter(|id| value_fields.iter().any(|(field, _)| field == id));
     }
+    let preset_prompt = crate::hole_presets::name_prompt(ctx, &mut d, &mut app.preferences.hole_presets, &app.session.doc);
+    if preset_prompt {
+        enter = false;
+        ok = false;
+        cancel = false;
+    }
     // Keyboard: Enter applies (from a value field, or with nothing focused), Esc cancels.
     let (enter_free, esc) = ctx.input(|i| (i.key_pressed(egui::Key::Enter), i.key_pressed(egui::Key::Escape)));
     let nothing_focused = ctx.memory(|m| m.focused().is_none());
@@ -2893,10 +2913,10 @@ pub fn show(app: &mut SolveApp, ctx: &egui::Context) {
         && !matches!(&d.kind, Kind::Motion(k) if k.wide())
         && !matches!(&d.kind, Kind::Material { editor, .. } if editor.editing());
     let report_active = app.issue_report.draft.is_some();
-    if !report_active && enter_applies && app.applying.is_none() && (enter || canvas_enter || (enter_free && nothing_focused)) {
+    if !preset_prompt && !report_active && enter_applies && app.applying.is_none() && (enter || canvas_enter || (enter_free && nothing_focused)) {
         ok = true;
     }
-    if !report_active && esc && !app.esc_handled {
+    if !preset_prompt && !report_active && esc && !app.esc_handled {
         app.esc_handled = true;
         cancel = true;
     }
@@ -2908,9 +2928,10 @@ pub fn show(app: &mut SolveApp, ctx: &egui::Context) {
         && let Some(mut plane) = crate::sketch_attachment_ui::face_plane(app, sel)
     {
         plane["fixed"] = json!(true);
+        let before = app.settled_cam();
         match app.run("sketch.create", json!({"plane":plane})) {
             Ok(_) => {
-                look_at_sketch(app);
+                app.look_at_opened_sketch(before);
                 cancel = true;
                 then_start = d.then_start;
             }
@@ -3112,6 +3133,14 @@ fn to_object_on(inputs: &[SelInput]) -> bool {
 /// Add or remove the To Object input; the active input moves to it when it is added.
 fn set_to_object(inputs: &mut Vec<SelInput>, active: &mut usize, on: bool) {
     set_object(inputs, active, TO_OBJECT, on);
+}
+
+/// A personal preset remembers the extent mode, never its destination geometry.
+pub(crate) fn preset_to_object(d: &mut Dialog, on: bool) {
+    set_to_object(&mut d.inputs, &mut d.active, on);
+    if let Some(input) = d.inputs.iter_mut().find(|input| input.label == TO_OBJECT) {
+        input.items.clear();
+    }
 }
 
 fn set_object(inputs: &mut Vec<SelInput>, active: &mut usize, label: &'static str, on: bool) {
@@ -3317,8 +3346,9 @@ pub fn start_sketch(app: &mut SolveApp, sel: &Sel) -> Result<(), String> {
     {
         params["flip"] = json!(flip);
     }
+    let before = app.settled_cam();
     app.run("sketch.create", params).map_err(|error| crate::friendly_error("sketch.create", &error))?;
-    look_at_sketch(app);
+    app.look_at_opened_sketch(before);
     // On a face: look at the picked point, not the plane's origin (a corner of the face),
     // which left the face filling the view off-centre like a big square.
     if let Sel::Face { point, .. } = sel
@@ -3531,7 +3561,8 @@ pub fn apply_commands(app: &SolveApp, d: &Dialog) -> Result<Vec<(String, Value)>
         *value = crate::length_input::expression(&app.session.doc, value, ValueKind::Length);
     }
     crate::length_input::extra(&mut normalized.extra, |e| crate::length_input::expression(&app.session.doc, e, ValueKind::Length));
-    let cmds = dialog_commands(app, &normalized)?;
+    let mut cmds = dialog_commands(app, &normalized)?;
+    exact_regions(d, &mut cmds);
     if let Some((id, _)) = d.editing {
         let (cmd, mut params) = cmds.into_iter().next().ok_or("nothing to apply")?;
         if let Some(feature) = app.session.doc.feature(id) {
@@ -3562,6 +3593,23 @@ pub fn apply_commands(app: &SolveApp, d: &Dialog) -> Result<Vec<(String, Value)>
         return Ok(vec![("timeline.redefine".into(), json!({"feature": id, "command": cmd, "params": params}))]);
     }
     Ok(cmds)
+}
+
+/// A dialog highlights exactly the profile regions it picks, so its commands build exactly those:
+/// a region cut off by the projected outline of the face a sketch is on stays the one region
+/// clicked (#6724). Without `exact_regions` a command grows such a pick to the whole drawn profile
+/// (#5302), which the highlight and the count would not show.
+fn exact_regions(d: &Dialog, cmds: &mut [(String, Value)]) {
+    if !d.inputs.iter().any(|input| input.items.iter().any(|item| matches!(item, Sel::Profile { .. }))) {
+        return;
+    }
+    for (_, params) in cmds {
+        if let Some(map) = params.as_object_mut()
+            && (map.contains_key("profiles") || map.contains_key("sections"))
+        {
+            map.insert("exact_regions".into(), json!(true));
+        }
+    }
 }
 
 /// The commands the live preview runs: OK's, with a joint's motion while it animates.
@@ -4140,13 +4188,16 @@ fn dialog_commands(app: &SolveApp, d: &Dialog) -> Result<Vec<(String, Value)>, S
             need(0, "faces")?;
             ("solid.offset_face", json!({"faces": face_points(0)}))
         }
-        Kind::Thread { designation, length, suggested, .. } => {
+        Kind::Thread { designation, length, suggested, handedness, .. } => {
             need(0, "a cylindrical face")?;
             let mut p = json!({"face": face_points(0).into_iter().next().unwrap_or(Value::Null)});
             if !designation.trim().is_empty() && suggested.as_deref() != Some(designation.as_str()) {
                 p["designation"] = json!(designation.trim());
             }
             put(&mut p, &[("length", length)]);
+            if !handedness.is_right() {
+                p["handedness"] = json!(handedness);
+            }
             ("solid.thread", p)
         }
         Kind::Material { index, editor } => {
@@ -4267,6 +4318,9 @@ fn dialog_commands(app: &SolveApp, d: &Dialog) -> Result<Vec<(String, Value)>, S
                     params["thread"] = json!(opts.thread.trim());
                     if !opts.thread_full_depth {
                         params["thread_depth"] = json!(opts.thread_depth.trim());
+                    }
+                    if !opts.handedness.is_right() {
+                        params["handedness"] = json!(opts.handedness);
                     }
                 }
                 match *kind {
@@ -5171,7 +5225,7 @@ pub fn for_feature(app: &SolveApp, id: u64, marker: Option<usize>) -> Option<Dia
             d.extra.insert("pull".into(), pt3(pull.0));
             d
         }
-        FeatureKind::Hole { position, at, direction, diameter, depth, hole, points, thread, thread_depth, to, references } => {
+        FeatureKind::Hole { position, at, direction, diameter, depth, hole, points, thread, thread_depth, handedness, to, references } => {
             let mut d = start("solid.hole")?;
             let mut k = hole_defaults(s);
             if let Kind::Hole { diameter: dia, depth: dep, kind, cb_diameter, cb_depth, cs_diameter, cs_angle, opts } = &mut k {
@@ -5179,6 +5233,7 @@ pub fn for_feature(app: &SolveApp, id: u64, marker: Option<usize>) -> Option<Dia
                 opts.all = depth.is_none();
                 opts.angled = matches!(hole, HoleKind::Drilled { .. });
                 opts.multiple = points.as_ref().is_some_and(|sp| !sp.single);
+                opts.handedness = *handedness;
                 if let Some(th) = thread {
                     opts.tapped = true;
                     opts.thread = th.clone();
@@ -5656,7 +5711,7 @@ pub fn for_feature(app: &SolveApp, id: u64, marker: Option<usize>) -> Option<Dia
             }
             d
         }
-        FeatureKind::Thread { face, designation, length, modeled } => {
+        FeatureKind::Thread { face, designation, length, modeled, handedness } => {
             let mut d = start("solid.thread")?;
             if *modeled {
                 d.extra.insert("modeled".into(), json!(true));
@@ -5664,6 +5719,7 @@ pub fn for_feature(app: &SolveApp, id: u64, marker: Option<usize>) -> Option<Dia
             d.kind = Kind::Thread {
                 designation: designation.clone().unwrap_or_default(),
                 length: length.as_deref().map(str::to_string).unwrap_or_default(),
+                handedness: *handedness,
                 suggested: None,
                 of: Vec::new(),
             };

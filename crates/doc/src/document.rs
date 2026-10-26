@@ -15,6 +15,21 @@ pub const MAX_PARAMS: usize = 10_000;
 /// numbers, and far from overflowing the next id.
 pub const MAX_FEATURE_ID: u64 = 1 << 52;
 
+/// Screw direction independent of the cylinder's placement and the picked end.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, solidcraft_derive::Walk)]
+#[serde(rename_all = "lowercase")]
+pub enum ThreadHandedness {
+    #[default]
+    Right,
+    Left,
+}
+
+impl ThreadHandedness {
+    pub fn is_right(&self) -> bool {
+        *self == Self::Right
+    }
+}
+
 /// A named parameter. User parameters are created by the user; model parameters (`d1`, `d2`…)
 /// are created by dimensions and features.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -764,6 +779,9 @@ pub enum FeatureKind {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         #[walk(length = "Thread depth")]
         thread_depth: Option<Expr>,
+        /// Screw direction of the cosmetic thread; older holes are right-handed.
+        #[serde(default, skip_serializing_if = "ThreadHandedness::is_right")]
+        handedness: ThreadHandedness,
         /// To Object: drill down to the face (or point) here instead of `depth`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         to: Option<FacePick>,
@@ -786,6 +804,8 @@ pub enum FeatureKind {
         length: Option<Expr>,
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         modeled: bool,
+        #[serde(default, skip_serializing_if = "ThreadHandedness::is_right")]
+        handedness: ThreadHandedness,
     },
     /// Ruled loft through profiles of several sketches, in order.
     Loft {
@@ -3037,21 +3057,30 @@ impl Document {
         *self == normalized
     }
 
-    /// Only components' part properties (metadata and free properties) changed: nothing to
+    /// Only part properties changed (the fields `with_part_properties_of` names): nothing to
     /// evaluate. The same whole-Document proof as [`Document::differs_only_in_render`].
     pub fn differs_only_in_part_properties(&self, previous: &Document) -> bool {
-        if self.components.len() != previous.components.len()
-            || self.components.iter().zip(&previous.components).any(|(a, b)| a.id != b.id)
-            || self.components == previous.components
-        {
-            return false;
+        previous.with_part_properties_of(self).is_some_and(|normalized| normalized == *self)
+    }
+
+    /// This design with `other`'s part properties, or `None` when they are this design's
+    /// already (then nothing is copied). The part properties are the fields that change no
+    /// geometry: the design's metadata, and each component's metadata and free properties. A
+    /// field that joins them is compared and copied here, and nowhere else.
+    fn with_part_properties_of(&self, other: &Document) -> Option<Document> {
+        let same = self.metadata == other.metadata
+            && self.components.iter().zip(&other.components).all(|(c, o)| c.metadata == o.metadata && c.properties == o.properties);
+        if same {
+            return None;
         }
-        let mut normalized = previous.clone();
-        for (n, c) in normalized.components.iter_mut().zip(&self.components) {
-            n.metadata = c.metadata.clone();
-            n.properties = c.properties.clone();
+        let mut out = self.clone();
+        out.metadata.clone_from(&other.metadata);
+        // Paired by position: if the components themselves differ, so do the designs.
+        for (c, o) in out.components.iter_mut().zip(&other.components) {
+            c.metadata.clone_from(&o.metadata);
+            c.properties.clone_from(&o.properties);
         }
-        *self == normalized
+        Some(out)
     }
 
     /// The colour a body is shown and exported in (sRGB as 0–1 fractions): its appearance,
