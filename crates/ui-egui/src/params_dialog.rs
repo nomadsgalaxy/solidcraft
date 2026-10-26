@@ -21,7 +21,7 @@ use crate::ui_kit::{self, Column};
 /// can't be picked (#3216).
 pub(crate) const IMPORT_TYPES: &[&str] = &["csv", "json"];
 
-const UNITS: [&str; 9] = ["mm", "cm", "m", "in", "ft", "deg", "rad", "", "um"];
+const UNITS: [&str; 10] = ["mm", "cm", "m", "in", "ft", "deg", "rad", "", "um", "text"];
 
 /// Dialog state (what is being typed; the parameters themselves live in the document).
 #[derive(Default)]
@@ -99,6 +99,8 @@ struct Row {
     source: String,
     group: String,
     favorite: bool,
+    /// A text parameter's text.
+    text: Option<String>,
 }
 
 fn rows(app: &mut SolveApp) -> Vec<Row> {
@@ -134,6 +136,7 @@ fn rows(app: &mut SolveApp) -> Vec<Row> {
                 error: r.get("error").and_then(Value::as_str).map(str::to_string),
                 comment: s(r, "comment"),
                 favorite: r.get("favorite").and_then(Value::as_bool).unwrap_or(false),
+                text: r.get("text").and_then(Value::as_str).map(str::to_string),
                 source,
                 group,
                 name,
@@ -146,7 +149,7 @@ fn show_value(r: &Row) -> String {
     match r.value {
         Some(v) if r.unit.is_empty() => format!("{v:.4}"),
         Some(v) => format!("{v:.4} {}", r.unit),
-        None => "—".into(),
+        None => r.text.clone().unwrap_or_else(|| "—".into()),
     }
 }
 
@@ -365,6 +368,9 @@ fn model_group(app: &mut SolveApp, ui: &mut egui::Ui, d: &mut ParamsDialog, grou
 /// Live check of an expression typed for a parameter of this unit: Ok(shown value) or the message.
 fn check(app: &mut SolveApp, e: &str, unit: &str) -> Result<String, String> {
     let r = app.session.execute("expr.evaluate", &json!({"expression": e, "unit": unit})).map_err(|e| e.to_string())?;
+    if let Some(text) = r["text"].as_str() {
+        return Ok(text.to_string());
+    }
     if r["ok"].as_bool().unwrap_or(false) {
         let v = r["display_value"].as_f64().unwrap_or(0.0);
         Ok(if unit.is_empty() { format!("{v:.4}") } else { format!("{v:.4} {unit}") })
@@ -681,7 +687,9 @@ fn add_row(app: &mut SolveApp, ui: &mut egui::Ui, table: &mut ui_kit::Table<'_>,
             }
             Err(error) => {
                 d.error = Some(error);
-                if let Some(id) = focused_id {
+                // Enter stays in the field that was submitted. A click into another cell
+                // has to keep that cell, or an invalid name cannot be corrected (#3965).
+                if submit && let Some(id) = focused_id {
                     ui.memory_mut(|m| m.request_focus(id));
                 }
             }

@@ -127,10 +127,11 @@ crate::dialog_descriptor::dialog_descriptors! {
             margin: String = "2 mm".into() => margin.to_string(),
         } => json!({"margin": margin});
         Pipe("solid.pipe", "PIPE", [("Path", CURVES, true)],
-            FeatureKind::Pipe { diameter, wall, .. }) {
+            FeatureKind::Pipe { diameter, wall, operation, .. }) {
             diameter: String = "5 mm".into() => diameter.to_string(),
             wall: String = String::new() => wall.as_deref().map(str::to_string).unwrap_or_default(),
-        } => json!({"diameter": diameter});
+            operation: usize = 0 => op_index(operation),
+        } => json!({"diameter": diameter, "operation": OPS.get(*operation).copied().unwrap_or("new")});
         Emboss("solid.emboss", "EMBOSS", [("Profiles", PROFILES, true), ("Target Face (optional)", FACES, false)],
             FeatureKind::Emboss { depth, deboss, .. }) {
             depth: String = "1 mm".into() => depth.to_string(),
@@ -441,6 +442,10 @@ pub struct Dialog {
     pub profile_selection_changed: bool,
     /// Give the on-canvas value box the keyboard (and select its text) on the next frame.
     pub focus: bool,
+    /// Last focused value editor, shared by the form and its on-canvas value box.
+    value_focus: Option<egui::Id>,
+    /// A viewport press or click returns the keyboard after selection and canvas updates.
+    pub(crate) restore_value_focus: bool,
     /// Folded to its header (the shared disclosure chevron).
     pub collapsed: bool,
     reset_scroll: bool,
@@ -605,6 +610,7 @@ fn fits(a: Accept, s: &Sel) -> bool {
         Sel::Body { .. } => a & BODIES != 0,
         Sel::Plane { .. } => a & PLANES != 0,
         Sel::Axis { .. } => a & AXES != 0,
+        Sel::ConstructionPoint { .. } => a & selection::CONSTRUCTION_POINTS != 0,
         Sel::SketchCurve { .. } => a & (AXES | CURVES | selection::SKETCH_LINES) != 0,
         Sel::ExternalSketchCurve { .. } => a & selection::SKETCH_LINES != 0,
         Sel::Vertex { .. } => a & selection::VERTICES != 0,
@@ -639,6 +645,8 @@ impl Dialog {
             editing: None,
             profile_selection_changed: false,
             focus: true,
+            value_focus: None,
+            restore_value_focus: false,
             collapsed: false,
             reset_scroll: true,
             preview_enabled: true,
@@ -795,7 +803,7 @@ impl Dialog {
             ),
             "solid.loft" => Dialog::new(Kind::Loft { operation: usize::from(has_bodies), rail_fit: 0 }, {
                 let [rail, rail2] = crate::dialogs_sweep::rail_inputs();
-                vec![SelInput::new("Profiles", PROFILES, true), rail, rail2]
+                vec![SelInput::new("Profiles", PROFILES | selection::POINTS, true), rail, rail2]
             }),
             "solid.sweep" => Dialog::new(Kind::Sweep { operation: usize::from(has_bodies), opts: crate::dialogs_sweep::SweepOpts::default() }, {
                 let [rail, rail2] = crate::dialogs_sweep::rail_inputs();
@@ -990,6 +998,18 @@ impl Dialog {
 
     pub fn edit_param(s: &Session, name: &str) -> Dialog {
         Dialog::new(Kind::EditParam { name: name.into(), expr: s.doc.param(name).map(|p| p.expr.clone()).unwrap_or_default() }, vec![])
+    }
+
+    /// An Extrude or Revolve started from inside a sketch takes that sketch's profile, as it would
+    /// had the sketch stayed open.
+    pub(crate) fn take_sketch_profile(&mut self, s: &Session, sketch: u64) {
+        if matches!(self.kind, Kind::Extrude { .. } | Kind::Revolve { .. })
+            && let Some(inp) = self.inputs.first_mut()
+            && inp.items.is_empty()
+        {
+            inp.items = single_profile(s, sketch);
+            self.advance();
+        }
     }
 
     /// Make the first single input still empty (after the filled ones) active.
@@ -1434,12 +1454,15 @@ fn fillet_edges(s: &Session, sel: &Sel, chain: bool) -> Vec<Sel> {
 /// the last sketch's while no feature builds from it yet. A used profile (a cube's sketch on its
 /// bottom face) is only taken when it is picked.
 fn default_profiles(s: &Session) -> Vec<Sel> {
-    let st = s.world_state();
     let sid = s.active_sketch.or_else(|| {
         s.doc.features.iter().rev().find(|f| matches!(f.kind, FeatureKind::Sketch { .. })).map(|f| f.id).filter(|&id| !profiles_used(s, id))
     });
-    match sid.and_then(|id| st.sketch(id).map(|ss| (id, ss.profiles.len()))) {
-        Some((id, 1)) => vec![Sel::Profile { sketch: id, index: 0 }],
+    sid.map(|id| single_profile(s, id)).unwrap_or_default()
+}
+
+fn single_profile(s: &Session, sketch: u64) -> Vec<Sel> {
+    match s.world_state().sketch(sketch).map(|ss| ss.profiles.len()) {
+        Some(1) => vec![Sel::Profile { sketch, index: 0 }],
         _ => Vec::new(),
     }
 }
@@ -2048,7 +2071,7 @@ fn selection_label(s: &Session, item: &Sel) -> String {
     match item {
         Sel::SketchCurve { id, .. } => id.clone(),
         Sel::SketchPoint { id } => crate::sketch_modify_ui::point_id(s, item).unwrap_or(id).to_string(),
-        Sel::Plane { name } | Sel::Axis { name } | Sel::Body { name } => name.clone(),
+        Sel::Plane { name } | Sel::Axis { name } | Sel::ConstructionPoint { name } | Sel::Body { name } => name.clone(),
         Sel::Face { body, index, .. } => format!("{body} · face {index}"),
         Sel::Edge { body, index, .. } => format!("{body} · edge {index}"),
         Sel::Feature { id } => s.doc.feature(*id).map(|f| f.name.clone()).unwrap_or_else(|| format!("Feature {id}")),
@@ -2270,7 +2293,7 @@ fn error_rows(app: &mut SolveApp, ctx: &egui::Context, d: &mut Dialog, ui: &mut 
 /// message is in the catalogs.
 fn shown_error(error: &str) -> String {
     let msg = error.strip_prefix("invalid parameters for `").and_then(|rest| rest.split_once("`: ")).map_or(error, |(_, msg)| msg);
-    crate::i18n::tr_label(msg).to_string()
+    crate::i18n::tr_diagnostic(crate::i18n::tr_label(msg))
 }
 
 /// Find the Boundary Fill cells again when the tool bodies changed (keeping the choices of
@@ -2552,6 +2575,7 @@ pub fn show(app: &mut SolveApp, ctx: &egui::Context) {
     let mut apply_again = app.applying.is_some() && d.repeat_after_apply;
     let mut cancel = false;
     let mut enter = false;
+    let mut value_fields = Vec::new();
     let wide = matches!(&d.kind, Kind::Motion(k) if k.wide());
 
     let raw_title = title(&d.kind);
@@ -2642,7 +2666,9 @@ pub fn show(app: &mut SolveApp, ctx: &egui::Context) {
             }
             let body = |ui: &mut egui::Ui| {
                 d.sync_fillet_chain(&app.session);
-                enter |= dense::rows(app, ctx, &mut d, ui);
+                let (accepted, fields) = crate::ui_kit::value_fields(ctx, || dense::rows(app, ctx, &mut d, ui));
+                enter |= accepted;
+                value_fields = fields;
                 d.sync_fillet_chain(&app.session);
                 if cell_enter {
                     ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter));
@@ -2685,6 +2711,31 @@ pub fn show(app: &mut SolveApp, ctx: &egui::Context) {
     if let Some(r) = app.viewport.dialog_rect {
         crate::scenario::publish_rect("dialog:outer", r);
         crate::scenario::publish_target("dialog:card", r);
+    }
+    if let Some(field) = crate::ui_kit::canvas_value_focus(ctx) {
+        value_fields.push(field);
+    }
+    // The editor loses the keyboard while the click is still being handled, possibly in a later
+    // pass of the same frame, so give it back once the pointer is idle again.
+    let pointer_busy = ctx.input(|i| i.pointer.any_down() || i.pointer.any_pressed() || i.pointer.any_released());
+    if d.restore_value_focus && !pointer_busy {
+        d.restore_value_focus = false;
+        let target = value_fields.iter().find(|(id, _)| Some(*id) == d.value_focus).or_else(|| value_fields.first());
+        if let Some(&(id, length)) = target {
+            d.focus = false;
+            ctx.memory_mut(|memory| memory.request_focus(id));
+            if let Some(mut state) = egui::text_edit::TextEditState::load(ctx, id) {
+                state
+                    .cursor
+                    .set_char_range(Some(egui::text_selection::CCursorRange::two(egui::text::CCursor::new(0), egui::text::CCursor::new(length))));
+                state.store(ctx, id);
+            }
+        }
+    }
+    if d.restore_value_focus {
+        ctx.request_repaint();
+    } else {
+        d.value_focus = ctx.memory(|memory| memory.focused()).filter(|id| value_fields.iter().any(|(field, _)| field == id));
     }
     // Keyboard: Enter applies (from a value field, or with nothing focused), Esc cancels.
     let (enter_free, esc) = ctx.input(|i| (i.key_pressed(egui::Key::Enter), i.key_pressed(egui::Key::Escape)));
@@ -3659,20 +3710,33 @@ fn dialog_commands(app: &SolveApp, d: &Dialog) -> Result<Vec<(String, Value)>, S
         }
         Kind::Loft { operation, rail_fit } => {
             need(0, "profiles of two or more sketches")?;
-            // One section per sketch, in the order the sketches were first picked.
-            let mut sections: Vec<(u64, Vec<usize>)> = Vec::new();
+            // One section per sketch, in the order the sketches were first picked; a sketch point
+            // is a section of its own, an apex the loft closes to (#4830).
+            let mut sections: Vec<(u64, Vec<usize>, Option<&str>)> = Vec::new();
             for x in sels(d, 0) {
-                if let Sel::Profile { sketch, index } = x {
-                    match sections.iter_mut().find(|(sk, _)| sk == sketch) {
-                        Some((_, v)) => v.push(*index),
-                        None => sections.push((*sketch, vec![*index])),
+                match x {
+                    Sel::Profile { sketch, index } => match sections.iter_mut().find(|(sk, _, apex)| sk == sketch && apex.is_none()) {
+                        Some((_, v, _)) => v.push(*index),
+                        None => sections.push((*sketch, vec![*index], None)),
+                    },
+                    Sel::SketchPoint { id } => {
+                        if let Some((sk, point)) = id.split_once(':').and_then(|(sk, point)| Some((sk.parse::<u64>().ok()?, point))) {
+                            sections.push((sk, Vec::new(), Some(point)));
+                        }
                     }
+                    _ => {}
                 }
             }
             if sections.len() < 2 {
-                return Err("pick profiles in two or more sketches".into());
+                return Err("pick profiles in two or more sketches, or a profile and a sketch point".into());
             }
-            let sections: Vec<Value> = sections.into_iter().map(|(sk, v)| json!({"sketch": sk, "profiles": v})).collect();
+            let sections: Vec<Value> = sections
+                .into_iter()
+                .map(|(sk, v, apex)| match apex {
+                    Some(point) => json!({"sketch": sk, "point": point}),
+                    None => json!({"sketch": sk, "profiles": v}),
+                })
+                .collect();
             let mut p = json!({"sections": sections, "operation": OPS.get(*operation).copied().unwrap_or("new")});
             crate::dialogs_sweep::rail_params(app, *rail_fit, [sels(d, 1), sels(d, 2)], &mut p)?;
             ("solid.loft", p)
@@ -4432,7 +4496,7 @@ fn emboss_face_sel(s: &Session, component: u64, face: &solidcraft_engine::doc::E
 /// Plane At Angle have dialogs of their own.
 fn construct_picks(id: &str) -> Option<(&'static str, &'static str, &'static [(&'static str, Accept, &'static str)])> {
     const PLANE: Accept = PLANES | PLANAR_FACES;
-    const POINT: Accept = selection::VERTICES | selection::POINTS;
+    const POINT: Accept = selection::VERTICES | selection::POINTS | selection::CONSTRUCTION_POINTS;
     const LINE: Accept = EDGES | AXES;
     const CURVE: Accept = EDGES | CURVES;
     Some(match id {
@@ -4486,6 +4550,7 @@ fn construct_ref(app: &SolveApp, sel: &Sel) -> Result<Value, String> {
         Sel::Vertex { point, .. } => json!({"vertex": pt(*point)}),
         Sel::Plane { name } => json!({"plane": name}),
         Sel::Axis { name } => json!({"axis": name}),
+        Sel::ConstructionPoint { name } => json!({"construct_point": name}),
         // Picked across sketches as "<sketch id>:<point id>".
         Sel::SketchPoint { id } => match id.split_once(':').and_then(|(sk, p)| Some((sk.parse::<u64>().ok()?, p))) {
             Some((sketch, point)) => json!({"sketch": sketch, "point": point}),
@@ -5302,13 +5367,12 @@ pub fn for_feature(app: &SolveApp, id: u64, marker: Option<usize>) -> Option<Dia
             }
             d
         }
-        FeatureKind::Pipe { path_sketch, path, operation, targets, .. } => {
+        FeatureKind::Pipe { path_sketch, path, targets, .. } => {
             let mut d = start("solid.pipe")?;
             d.kind = Kind::simple_restore(&f.kind)?;
             if let Some(inp) = d.inputs.first_mut() {
                 inp.items = path.iter().map(|id| crate::selection::curve_pick(id, path_sketch.0, s.active_sketch)).collect();
             }
-            d.extra.insert("operation".into(), json!(OPS.get(op_index(operation)).copied().unwrap_or("new")));
             if !targets.is_empty() {
                 d.extra.insert("targets".into(), json!(targets));
             }
