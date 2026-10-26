@@ -59,6 +59,26 @@ fn edge_picks_far_from_every_edge_are_refused() {
 }
 
 #[test]
+fn edge_picks_at_a_corner_are_refused() {
+    for (id, size) in [("solid.chamfer", "distance"), ("solid.fillet", "radius")] {
+        let mut s = Session::default();
+        run(&mut s, "solid.box", json!({"length": 20, "width": 20, "height": 20}));
+        let features = s.doc.features.len();
+        for edge in [json!([20, 20, 20]), json!({"point": [20, 20, 20]})] {
+            let err = s.execute(id, &json!({"edges": [edge], size: 2})).unwrap_err().to_string();
+            assert!(err.contains("[20, 20, 20]") && err.contains("3 edges") && err.contains("midpoint"), "{id}: {err}");
+            assert_eq!(s.doc.features.len(), features);
+            assert!((volume(&mut s) - 8000.0).abs() < 1e-6);
+        }
+        // 1 mm from the corner along one edge: near the other two, but on just that one.
+        run(&mut s, id, json!({"edges": [[19, 20, 20]], size: 2}));
+        assert_eq!(s.doc.features.len(), features + 1);
+        let removed = if id == "solid.chamfer" { 40.0 } else { (4.0 - PI) * 20.0 };
+        assert!(rel(volume(&mut s), 8000.0 - removed) < 2e-4);
+    }
+}
+
+#[test]
 fn fillet_as_wide_as_a_face_rounds_it_off() {
     // #199: 14 x 6 x 10 box, the four vertical edges at r = 3 (half the 6 mm end faces).
     let mut s = Session::default();
@@ -1259,7 +1279,8 @@ fn body_volume(st: &solidcraft_doc::ModelState) -> f64 {
     st.bodies.iter().map(|b| solidcraft_kernel::measure(&b.body).unwrap().volume).sum()
 }
 
-/// Deleting an inserted assembly frees its body names without leaving assembly ownership behind.
+/// Deleting an inserted assembly keeps the names of the bodies that remain, and leaves no assembly
+/// ownership behind.
 #[test]
 fn step_insert_delete_removes_assembly_and_undo_restores_it() {
     let dir = std::env::temp_dir().join(format!("solidcraft-step-delete-{}", std::process::id()));
@@ -1294,7 +1315,7 @@ fn step_insert_delete_removes_assembly_and_undo_restores_it() {
     assert!(s.doc.body_components.is_empty());
     assert!(s.doc.body_offsets.is_empty());
     let state = s.model.state();
-    let mirrored = state.body("Part (2)").unwrap();
+    let mirrored = state.body("Part (3)").unwrap();
     assert_eq!(s.doc.model_body_component(mirrored), 0);
     run(&mut s, "solid.box", json!({"length": 5, "width": 5, "height": 5, "corner": [40, 0, 0], "operation": "new", "body_name": "Other"}));
     assert_eq!(s.doc.model_body_component(s.model.state().body("Other").unwrap()), 0);

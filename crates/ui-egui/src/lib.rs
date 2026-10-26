@@ -58,6 +58,7 @@ pub mod drag_extrude;
 pub mod drag_snap;
 pub mod easyprint_ui;
 pub mod edit_clipboard;
+mod feature_edit;
 #[cfg(test)]
 mod font_literals_tests;
 pub mod fonts;
@@ -196,6 +197,8 @@ pub mod render_workspace;
 mod revolve_edit_tests;
 #[cfg(test)]
 mod revolve_manipulator_tests;
+#[cfg(test)]
+mod round_pick_tests;
 mod rule_editor;
 #[cfg(test)]
 mod rule_editor_tests;
@@ -280,6 +283,11 @@ use solidcraft_engine::render::{Camera, CameraAnim, StandardView};
 
 pub use control::{ControlRequest, ControlResponse};
 
+/// How close (radians) the camera must be to a standard axis view for the #2682 mode
+/// (`auto_ortho_faces`) to snap the projection to orthographic. One degree: exact axis views
+/// and Shift-snapped orbits land inside it, free orbiting does not linger in it.
+pub const ORTHO_FACE_TOLERANCE: f64 = 1.0_f64.to_radians();
+
 /// UI state that automation can read and set (`ui.set`).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
@@ -299,6 +307,9 @@ pub struct UiState {
     pub show_timeline: bool,
     pub show_grid: bool,
     pub perspective: bool,
+    /// Perspective while orbiting, orthographic when the camera faces a standard axis view
+    /// (#2682). Off by default; when on it decides the projection instead of `perspective`.
+    pub auto_ortho_faces: bool,
     pub palette_open: bool,
     /// Dark theme (the default); a preference kept between runs.
     pub dark: bool,
@@ -330,6 +341,7 @@ impl Default for UiState {
             show_timeline: true,
             show_grid: true,
             perspective: false,
+            auto_ortho_faces: false,
             palette_open: false,
             dark: true,
             pick_off: Vec::new(),
@@ -456,6 +468,8 @@ pub struct SolveApp {
     pub preview: preview::PreviewState,
     /// OK pressed on a feature that takes a while: its evaluation runs off the window thread.
     pub applying: Option<dialogs::Applying>,
+    pub(crate) editing_state: Option<dialogs::EditingState>,
+    pub(crate) pending_feature_edit: Option<feature_edit::PendingFeatureEdit>,
     /// A command recomputing the history (the marker moved, undo) computing off the window
     /// thread, and those asked for meanwhile ([`deferred`]).
     pub deferred: Option<deferred::Deferred>,
@@ -502,6 +516,8 @@ pub struct SolveApp {
     pub msaa_supported: Vec<u32>,
     /// The startup check selected 1x; Graphics explains the workaround.
     pub msaa_compatibility: bool,
+    /// Startup fallback diagnostic, also shown in Graphics preferences.
+    pub graphics_fallback: Option<String>,
     /// Settings put back at start because they kept SolidCraft from starting, one line each,
     /// shown until dismissed (`prefs::show_reset_notice`).
     pub settings_reset: Vec<prefs::SettingReset>,
@@ -633,6 +649,8 @@ impl SolveApp {
             slicer_menu: dialogs_save_mesh::SlicerMenu::default(),
             preview: preview::PreviewState::default(),
             applying: None,
+            editing_state: None,
+            pending_feature_edit: None,
             deferred: None,
             deferred_queue: Vec::new(),
             start_after_roll: None,
@@ -656,6 +674,7 @@ impl SolveApp {
             stand_up_reason: false,
             msaa_supported: Vec::new(),
             msaa_compatibility: false,
+            graphics_fallback: None,
             settings_reset: Vec::new(),
             big_operation: false,
             autosave_minutes: 5.0,
@@ -793,6 +812,7 @@ impl SolveApp {
             "dark": self.ui.dark,
             "grid": self.ui.show_grid,
             "perspective": self.ui.perspective,
+            "auto_ortho_faces": self.ui.auto_ortho_faces,
             "pick_bodies": self.ui.pick_bodies,
             "auto_project": self.session.auto_project,
             "visual_style": self.ui.visual_style,
@@ -829,6 +849,9 @@ impl SolveApp {
         }
         if let Some(p) = flag("perspective") {
             self.ui.perspective = p;
+        }
+        if let Some(a) = flag("auto_ortho_faces") {
+            self.ui.auto_ortho_faces = a;
         }
         if let Some(b) = flag("pick_bodies") {
             self.ui.pick_bodies = b;
@@ -902,6 +925,11 @@ impl SolveApp {
         let t0 = now_ms();
         let r = self.session.execute(id, &params).map_err(|e| e.to_string());
         self.big_operation |= now_ms() - t0 >= recovery_ui::BIG_OPERATION_MS;
+        self.command_completed(id, r)
+    }
+
+    /// Host effects shared by directly executed and already evaluated commands.
+    pub(crate) fn command_completed(&mut self, id: &str, r: Result<Value, String>) -> Result<Value, String> {
         if let Ok(v) = &r {
             if id == "view.layout" {
                 let layout =
@@ -1000,6 +1028,9 @@ impl SolveApp {
                     // The old document is already replaced: discard its editor without
                     // applying cancellation hooks (such as restoring its timeline marker).
                     self.dialog = None;
+                    self.applying = None;
+                    self.editing_state = None;
+                    self.pending_feature_edit = None;
                     self.tool = None;
                     self.preview.reset();
                     self.cam = Camera::default();
@@ -1153,6 +1184,9 @@ impl SolveApp {
         dim_view::cancel();
         self.tool = None;
         self.home.open = false;
+        if dialogs_sheet::start_export(self, id) {
+            return;
+        }
         if let Some(ext) = id.strip_prefix("sketch.insert_").filter(|e| matches!(*e, "dxf" | "svg")) {
             self.pick_open_command(id, json!({}), &[ext]);
             return;
@@ -1227,6 +1261,10 @@ impl SolveApp {
         }
         // Press Pull: edges get a fillet, curved faces an offset, planar faces and profiles an extrude.
         if id == "solid.press_pull" {
+            if let Some(pending) = &mut self.pending_feature_edit {
+                pending.then_start(id);
+                return;
+            }
             let sel = &self.session.selection;
             let edges = sel.iter().any(|s| matches!(s, solidcraft_engine::Sel::Edge { .. }));
             let curved = sel.iter().any(
@@ -1248,6 +1286,15 @@ impl SolveApp {
                 d.press_pull = true;
             }
             return;
+        }
+        let interactive = self.interactive(id);
+        if interactive && let Some(pending) = &mut self.pending_feature_edit {
+            pending.then_start(id);
+            return;
+        }
+        // Cancel before finishing a sketch or waiting for its history marker.
+        if interactive && (self.editing_state.is_some() || self.applying.is_some()) {
+            dialogs::cancel(self);
         }
         let finished_sketch = self.session.active_sketch.filter(|_| ends_sketch(id) && self.interactive(id));
         if finished_sketch.is_some() {
@@ -1354,6 +1401,7 @@ impl SolveApp {
     /// timeline back to just before themselves and reopen their dialog, filled in.
     pub fn edit_feature(&mut self, id: u64) {
         use solidcraft_engine::doc::FeatureKind;
+        dialogs::cancel(self);
         let Some(f) = self.session.doc.feature(id) else { return };
         if matches!(f.kind, FeatureKind::Sketch { .. }) {
             self.edit_sketch(id);
@@ -1362,14 +1410,28 @@ impl SolveApp {
         let Some(idx) = self.session.doc.feature_index(id) else { return };
         let marker = self.finish_sketch_for_edit();
         self.tool = None;
+        if self.session.doc.marker != marker {
+            self.prepare_feature_edit(id, idx, marker);
+            return;
+        }
+        let original = self.session.scratch();
         if dialogs::roll_marker(self, Some(idx)).is_err() {
             return;
         }
+        self.open_feature_edit(id, marker, original);
+    }
+
+    fn open_feature_edit(&mut self, id: u64, marker: Option<usize>, original: Session) {
+        self.editing_state = Some(dialogs::EditingState { source: self.session.scratch(), original });
         match dialogs::for_feature(self, id, marker) {
-            Some(d) => self.dialog = Some(d),
+            Some(d) => {
+                if !d.previews() {
+                    self.editing_state = None;
+                }
+                self.dialog = Some(d);
+            }
             None => {
-                let _ = dialogs::roll_marker(self, marker);
-                // No dialog for this feature: open the search box with the command to edit it.
+                dialogs::restore_editing(self, marker);
                 self.sbox.text = format!("timeline.edit {{\"feature\": {id}, \"set\": {{}}}}");
                 self.ui.palette_open = true;
             }
@@ -1409,7 +1471,11 @@ impl SolveApp {
     /// Pass the original marker to the next editor. Restoring it between editors could finish
     /// in the background after the next rollback, moving the marker out from under that edit.
     fn finish_sketch_for_edit(&mut self) -> Option<usize> {
-        let marker = self.pre_sketch_marker.take().unwrap_or(self.session.doc.marker);
+        let marker = self
+            .pending_feature_edit
+            .take()
+            .map(|pending| pending.marker)
+            .unwrap_or_else(|| self.pre_sketch_marker.take().unwrap_or(self.session.doc.marker));
         if self.session.active_sketch.is_some() {
             self.finish_sketch();
         }
@@ -1491,9 +1557,16 @@ impl SolveApp {
     }
 
     /// Is the view drawn in perspective? The perspective preference, except while a sketch is
-    /// open: a sketch is drawn and measured on its plane, so the view is parallel (no foreshortening).
+    /// open (always orthographic) or when the #2682 mode is on: then the view is orthographic
+    /// exactly when the camera faces a standard axis view, and perspective otherwise.
     pub fn perspective_view(&self) -> bool {
-        self.ui.perspective && self.session.active_sketch.is_none()
+        if self.session.active_sketch.is_some() {
+            return false;
+        }
+        if self.ui.auto_ortho_faces {
+            return self.cam.aligned_standard_view(ORTHO_FACE_TOLERANCE).is_none();
+        }
+        self.ui.perspective
     }
 
     pub fn set_status(&mut self, s: impl Into<String>, error: bool) {
@@ -1504,6 +1577,14 @@ impl SolveApp {
     }
 
     pub fn open_path(&mut self, path: &str) {
+        match documents::reuse_path(self, path) {
+            Ok(true) => return,
+            Err(e) => {
+                self.set_status(e, true);
+                return;
+            }
+            Ok(false) => {}
+        }
         self.home.open = false;
         documents::prepare_open(self);
         if let Ok(r) = self.run("doc.open", json!({ "path": path })) {
@@ -1825,6 +1906,7 @@ impl SolveApp {
                 }
             }
         }
+        control::publish_design(self, &control::DESIGN_WATCH);
     }
 
     /// Inject synthetic events (one pointer event per frame).
@@ -1907,6 +1989,7 @@ impl SolveApp {
         if self.file_picker_busy() {
             ui.ctx().request_repaint_after(std::time::Duration::from_millis(50));
         }
+        control::publish_design(self, &control::DESIGN_WATCH);
         self.frame_ms = now_ms() - t0;
         frame_watch::end(self);
     }
@@ -1920,6 +2003,7 @@ impl SolveApp {
         }
         self.ui.layout.publish(ui.ctx());
         scenario::clear_handles();
+        self.poll_feature_edit(ui.ctx());
         self.poll_deferred(ui.ctx());
         self.poll_delete_check(ui.ctx());
         if !self.embedded {

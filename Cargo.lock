@@ -4451,6 +4451,7 @@ dependencies = [
  "egui",
  "js-sys",
  "log",
+ "percent-encoding",
  "serde_json",
  "solidcraft-engine",
  "solidcraft-ui-egui",
@@ -5986,9 +5987,12 @@ name = "xtask"
 version = "0.23.1"
 dependencies = [
  "proc-macro2",
+ "serde",
  "serde_json",
  "sha2 0.10.9",
  "syn 2.0.119",
+ "toml",
+ "zip",
 ]
 
 [[package]]

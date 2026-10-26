@@ -956,6 +956,8 @@ pub struct EvalCache {
     order: std::collections::VecDeque<u64>,
     /// What the stored results cost together.
     bytes: usize,
+    /// The byte budget (0: [`CACHE_BYTES`]).
+    pub(crate) budget: usize,
     pub hits: usize,
 }
 
@@ -997,7 +999,8 @@ impl EvalCache {
         self.bytes = self.bytes.saturating_add(bytes);
         // One result is always kept, so a single state larger than the budget cannot empty the
         // cache and force a full recompute on every undo.
-        while self.order.len() > CACHE_ENTRIES || (self.bytes > CACHE_BYTES && self.order.len() > 1) {
+        let budget = if self.budget == 0 { CACHE_BYTES } else { self.budget };
+        while self.order.len() > CACHE_ENTRIES || (self.bytes > budget && self.order.len() > 1) {
             if let Some(k) = self.order.pop_front()
                 && let Some(old) = self.map.remove(&k)
             {
@@ -1099,6 +1102,22 @@ impl ModelState {
         bodies + sketches + self.sheets.len() * 4096 + self.threads.len() * 192 + self.construct.len() * 192
     }
 
+    /// [`ModelState::retained_bytes`] of what this state holds that `before` does not: bodies
+    /// and sketches it shares with `before` are already paid for by the cached state that made
+    /// them. Charging every cached state its whole model let a design whose model is large next
+    /// to the budget keep only its last few states, so setting a parameter back recomputed what
+    /// had dropped out.
+    fn added_bytes(&self, before: &ModelState) -> usize {
+        let bodies: usize = self
+            .bodies
+            .iter()
+            .filter(|b| !before.bodies.iter().any(|o| o.body.same_shape(&b.body)))
+            .map(|b| if b.bytes > 0 { b.bytes } else { b.body.retained_bytes() })
+            .sum();
+        let sketches: usize = self.sketches.iter().filter(|s| !before.sketches.iter().any(|o| Arc::ptr_eq(o, s))).map(|s| s.retained_bytes()).sum();
+        bodies + sketches + self.sheets.len() * 4096 + self.threads.len() * 192 + self.construct.len() * 192
+    }
+
     pub fn body(&self, name: &str) -> Option<&ModelBody> {
         self.bodies.iter().find(|b| b.name == name)
     }
@@ -1116,8 +1135,8 @@ impl ModelState {
             }
         });
     }
-    /// [`ModelState::warm_meshes`], and every body's display plan at the current display quality
-    /// (what a GPU viewport draws).
+
+    /// Prepare reference meshes and display plans at the current quality for ahead jobs.
     pub fn warm_display(&self) {
         let q = crate::display_quality::current();
         let planned = |b: &ModelBody| b.plan.get(q.index()).is_none_or(|cell| cell.get().is_some());
@@ -1125,6 +1144,19 @@ impl ModelState {
         kernel::for_each_on_threads(&cold, 16, |b| {
             let _ = b.mesh();
             let _ = b.display_plan();
+        });
+    }
+
+    /// Prepare reference picking geometry and the GPU plan/highlight mesh at exactly the
+    /// requested quality. The first viewport frame then consumes initialized caches only.
+    pub fn warm_display_at(&self, quality: crate::display_quality::DisplayQuality, go_on: impl Fn() -> bool + Sync) {
+        kernel::for_each_on_threads(&self.bodies, 16, |body| {
+            if go_on() {
+                let _ = body.mesh();
+            }
+            if go_on() {
+                let _ = body.plan_mesh_at(quality);
+            }
         });
     }
     pub fn sketch(&self, feature: u64) -> Option<&SolvedSketch> {
@@ -1446,7 +1478,43 @@ fn chain_fingerprint(
         }
         fp = h.finish();
     }
+    // A pattern or mirror of features replays its sources' definitions wherever they are in the
+    // timeline. One made with the timeline rolled back comes before them, where the chain doesn't
+    // cover them: its copies kept the size the sources had when they were made.
+    if let FeatureKind::Pattern { features, bodies, .. } | FeatureKind::Mirror { features, bodies, .. } = &f.kind
+        && bodies.is_empty()
+        && !features.is_empty()
+    {
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        fp.hash(&mut h);
+        for g in replayed_sources(doc, features) {
+            fingerprint(doc, 0, g, vals, false, steps).hash(&mut h);
+        }
+        fp = h.finish();
+    }
     fp
+}
+
+/// The features a pattern or mirror of `features` replays: each source, and the sources of one
+/// that is itself a pattern or mirror of features (see `copy_plan`), each once.
+fn replayed_sources<'a>(doc: &'a Document, features: &[crate::FeatureName]) -> Vec<&'a Feature> {
+    let mut out: Vec<&Feature> = Vec::new();
+    let mut todo: Vec<String> = crate::plain(features);
+    // A bound on the walk, as on the copy plan's nesting: a design can't make it run on.
+    for _ in 0..1024 {
+        let Some(name) = todo.pop() else { break };
+        let Ok(g) = source_feature(doc, &name) else { continue };
+        if out.iter().any(|x| x.id == g.id) {
+            continue;
+        }
+        if let FeatureKind::Pattern { features, bodies, .. } | FeatureKind::Mirror { features, bodies, .. } = &g.kind
+            && bodies.is_empty()
+        {
+            todo.extend(crate::plain(features));
+        }
+        out.push(g);
+    }
+    out
 }
 
 /// Document-level inputs any feature may read: construction planes (resolved by name), sheet
@@ -2084,6 +2152,7 @@ impl Model {
                 continue;
             }
             recomputed += 1;
+            let before = state.clone();
             let t0 = now();
             let mut next = (*state).clone();
             // The names the design must not use again travel with the state (#4957, #4302).
@@ -2173,7 +2242,7 @@ impl Model {
                     warning: warning.clone(),
                     boolean_diagnostics: boolean_diagnostics.clone(),
                     ms,
-                    bytes: state.retained_bytes(),
+                    bytes: state.added_bytes(&before),
                     state: state.clone(),
                 };
                 if let Some(k) = &self.kept.0 {
@@ -2309,7 +2378,7 @@ impl Model {
 
     /// Set every result's fingerprint to `doc`'s, so the next evaluation reuses every result
     /// (after a change that builds nothing differently).
-    fn refingerprint(&mut self, doc: &Document) {
+    pub fn refingerprint(&mut self, doc: &Document) {
         let (vals, _) = evaluation_values(doc);
         let marker = doc.marker.unwrap_or(usize::MAX);
         self.step_digests = StepDigests::of(doc, &self.step_digests);
@@ -2423,6 +2492,11 @@ fn new_name(state: &mut ModelState, f: &Feature, k: usize) -> String {
         && !n.is_empty()
         && state.body(n).is_none()
     {
+        // A pinned `BodyN` counts as handed out, so a design evaluated again from its stored
+        // names ends with the counter it had when the counter numbered them.
+        if let Some(number) = n.strip_prefix("Body").filter(|_| crate::is_counted_body_name(n)).and_then(|d| d.parse::<usize>().ok()) {
+            state.body_counter = state.body_counter.max(number);
+        }
         return n.clone();
     }
     // Bodies past the stored names (a profile added after the feature was made) are numbered
@@ -4021,17 +4095,15 @@ fn blend_body(
     Ok((Traced::step(nb.with_preserved_planar_sources(&mb.body)?, &[&from]), used, tapered))
 }
 
-/// The revolve axis in the sketch's 2D coordinates (a point on it, its direction). `construct`
-/// gives a construction axis, by name, in the sketch's 3D frame.
-pub(crate) fn revolve_axis(ss: &SolvedSketch, axis: &AxisRef, construct: &dyn Fn(&str) -> Result<(Vec3, Vec3)>) -> Result<(Vec2, Vec2)> {
-    let in_plane = |origin: Vec3, dir: Vec3| {
-        let pl = &ss.plane;
-        let d = dir.normalized().ok_or_else(|| DocError::Invalid("revolve axis has no direction".into()))?;
-        if d.dot(pl.normal()).abs() > 1e-9 || pl.height(origin).abs() > 1e-6 {
-            return Err(DocError::Invalid("the revolve axis does not lie in the sketch plane".into()));
-        }
-        Ok((pl.to_local(origin), Vec2::new(d.dot(pl.x), d.dot(pl.y))))
-    };
+/// The revolve axis in the sketch's plane coordinates (a point and a direction). `st` is the model
+/// an axis on an edge or face of it is found in; `construct` gives a construction axis, by name, in
+/// the sketch's 3D frame.
+pub(crate) fn revolve_axis(
+    ss: &SolvedSketch,
+    axis: &AxisRef,
+    st: &ModelState,
+    construct: &dyn Fn(&str) -> Result<(Vec3, Vec3)>,
+) -> Result<(Vec2, Vec2)> {
     match axis {
         AxisRef::SketchLine { curve } => {
             let ci = ss.sketch.curve_index(curve).ok_or_else(|| DocError::Unknown(format!("sketch line `{curve}`")))?;
@@ -4061,12 +4133,36 @@ pub(crate) fn revolve_axis(ss: &SolvedSketch, axis: &AxisRef, construct: &dyn Fn
             }
             Ok((pl.to_local(Vec3::ZERO), Vec2::new(d.dot(pl.x), d.dot(pl.y))))
         }
-        AxisRef::Line { origin, dir } => in_plane(origin.0, dir.0),
+        AxisRef::Line { origin, dir } => line_in_sketch_plane(ss, origin.0, dir.0),
+        AxisRef::Model { geo } => {
+            let (o, d) = crate::construct::model_axis(st, geo)?;
+            line_in_sketch_plane(ss, o, d)
+        }
         AxisRef::Construction { name } => {
-            let (origin, dir) = construct(name)?;
-            in_plane(origin, dir)
+            let (o, d) = construct(name)?;
+            line_in_sketch_plane(ss, o, d)
         }
     }
+}
+
+/// The model a revolve axis is found in: what construction geometry of component `comp` is built
+/// on when the axis is an edge or face of it (only then is it worth placing).
+pub(super) fn axis_state<'a>(doc: &Document, st: &'a ModelState, comp: u64, axis: &AxisRef) -> std::borrow::Cow<'a, ModelState> {
+    match axis {
+        AxisRef::Model { .. } => construction_state(doc, st, comp),
+        _ => std::borrow::Cow::Borrowed(st),
+    }
+}
+
+/// A world line through `origin` along `dir` in the sketch's plane coordinates, or an error when it
+/// does not lie in the sketch plane.
+fn line_in_sketch_plane(ss: &SolvedSketch, origin: Vec3, dir: Vec3) -> Result<(Vec2, Vec2)> {
+    let pl = &ss.plane;
+    let d = dir.normalized().ok_or_else(|| DocError::Invalid("revolve axis has no direction".into()))?;
+    if d.dot(pl.normal()).abs() > 1e-9 || pl.height(origin).abs() > 1e-6 {
+        return Err(DocError::Invalid("the revolve axis does not lie in the sketch plane".into()));
+    }
+    Ok((pl.to_local(origin), Vec2::new(d.dot(pl.x), d.dot(pl.y))))
 }
 
 /// A construction axis `name` of the timeline so far, as evaluated, in the frame of component
@@ -5230,7 +5326,8 @@ fn feature_tools_with_constructor(
                 f.component,
             )?;
             let regions = solidcraft_sketch::merge_regions(&select_profiles(&ss, profiles)?);
-            let (o, d) = revolve_axis(&ss, axis, &|name| construction_axis_in(Some(doc), st, name, f.component))?;
+            let (o, d) =
+                revolve_axis(&ss, axis, &axis_state(doc, st, f.component, axis), &|name| construction_axis_in(Some(doc), st, name, f.component))?;
             // To Object is in this feature's component frame: the model as seen from there.
             let tst = if to.is_some() { state_in_frame(doc, st, f.component) } else { std::borrow::Cow::Borrowed(st) };
             // Where the tool meets its targets is measured where they are shown (#3383).
@@ -6044,10 +6141,12 @@ fn pattern_transforms(doc: &Document, vals: &BTreeMap<String, Value>, st: &Model
                 out.push(m);
             }
         }
-        crate::PatternKind::Circular { origin, axis, count: c, angle, alignment, reversed, axis_feature } => {
-            let (origin, axis) = match axis_feature {
-                Some(name) => construction_axis_in(Some(doc), st, name, component)?,
-                None => (origin.0, axis.0),
+        crate::PatternKind::Circular { origin, axis, count: c, angle, alignment, reversed, axis_ref, axis_feature } => {
+            // On an edge or round face: about it as it is now; on a construction axis: where it is.
+            let (origin, axis) = match (axis_ref, axis_feature) {
+                (Some(g), _) => crate::construct::model_axis(&construction_state(doc, st, component), g)?,
+                (None, Some(name)) => construction_axis_in(Some(doc), st, name, component)?,
+                (None, None) => (origin.0, axis.0),
             };
             let n = count(c)?;
             let total = val(vals, angle, Kind::Angle)?;
@@ -6421,11 +6520,36 @@ fn replay(
             }
         }
         if op == Operation::Cut {
-            for instance in instances {
-                if let Some(tools) = copies.get(instance) {
+            for instance in &instances {
+                if let Some(tools) = copies.get(instance.clone()) {
                     total += 1;
                     missed += usize::from(copy_misses(st, f, &targets, tools));
                 }
+            }
+        }
+        // Copies of a cut through sheet metal are cut-outs of its flat pattern, as the cut is
+        // (#6841): each machined into the sheets in turn, then cut from the other targets.
+        if op == Operation::Cut && matches!(src.kind, FeatureKind::Extrude { .. }) && !st.sheets.is_empty() && instances.len() == mats.len() {
+            let mut handled = Vec::with_capacity(mats.len());
+            for (m, instance) in mats.iter().zip(&instances) {
+                let bodies: Vec<Body> = copies.get(instance.clone()).unwrap_or_default().iter().map(|t| t.body.clone()).collect();
+                handled.push(more::sheet_cut_copy(f, src, m, st, &bodies, &targets, warning)?);
+            }
+            if handled.iter().any(|h| !h.is_empty()) {
+                // Copies the same sheets took are cut from the rest at once.
+                let mut groups: Vec<(Vec<String>, Vec<Traced>)> = Vec::new();
+                let mut rest = copies.into_iter();
+                for (done, instance) in handled.into_iter().zip(&instances) {
+                    let tools: Vec<Traced> = rest.by_ref().take(instance.len()).collect();
+                    match groups.iter_mut().find(|(d, _)| *d == done) {
+                        Some((_, all)) => all.extend(tools),
+                        None => groups.push((done, tools)),
+                    }
+                }
+                for (done, tools) in groups {
+                    apply_beside_sheet_cut(doc, st, f, tools, op, &targets, &done)?;
+                }
+                continue;
             }
         }
         // New bodies from a pattern join their source when they touch it (as one feature would).
@@ -6692,11 +6816,12 @@ pub(crate) fn sheet_face_plane_in_frame(doc: &Document, st: &ModelState, comp: u
         PlaneRef::Offset { base, distance } => {
             PlaneRef::Offset { base: Box::new(sheet_face_plane_in_frame(doc, st, comp, base)?), distance: distance.clone() }
         }
-        PlaneRef::AtAngle { base, axis_origin, axis_dir, angle } => PlaneRef::AtAngle {
+        PlaneRef::AtAngle { base, axis_origin, axis_dir, angle, line } => PlaneRef::AtAngle {
             base: Box::new(sheet_face_plane_in_frame(doc, st, comp, base)?),
             axis_origin: *axis_origin,
             axis_dir: *axis_dir,
             angle: angle.clone(),
+            line: line.clone(),
         },
         PlaneRef::Flipped { base, about_y } => {
             PlaneRef::Flipped { base: Box::new(sheet_face_plane_in_frame(doc, st, comp, base)?), about_y: *about_y }
@@ -7689,6 +7814,7 @@ fn construction_state<'a>(doc: &Document, st: &'a ModelState, comp: u64) -> std:
 fn plane_is_fixed(plane: &PlaneRef) -> bool {
     match plane {
         PlaneRef::Origin { .. } | PlaneRef::Custom { .. } | PlaneRef::Placed { .. } => true,
+        PlaneRef::AtAngle { line: Some(_), .. } => false,
         PlaneRef::Offset { base, .. } | PlaneRef::AtAngle { base, .. } | PlaneRef::Flipped { base, .. } => plane_is_fixed(base),
         _ => false,
     }
@@ -7699,6 +7825,7 @@ fn plane_is_fixed(plane: &PlaneRef) -> bool {
 fn plane_reads_geometry(plane: &PlaneRef) -> bool {
     match plane {
         PlaneRef::Origin { .. } | PlaneRef::Custom { .. } | PlaneRef::Placed { .. } | PlaneRef::Construction { .. } => false,
+        PlaneRef::AtAngle { line: Some(_), .. } => true,
         PlaneRef::Offset { base, .. } | PlaneRef::AtAngle { base, .. } | PlaneRef::Flipped { base, .. } => plane_reads_geometry(base),
         PlaneRef::ThroughPoint { .. }
         | PlaneRef::Midplane { .. }
@@ -8182,6 +8309,51 @@ pub fn world_state_reusing(doc: &Document, st: &ModelState, placed_before: &mut 
     }
     *placed_before = placed_now;
     out
+}
+
+#[cfg(test)]
+mod display_preparation_tests {
+    use super::*;
+
+    fn state() -> ModelState {
+        let body = kernel::box_solid(Vec3::ZERO, Vec3::new(2.0, 3.0, 4.0)).unwrap();
+        ModelState { bodies: vec![ModelBody::new("Box".into(), body, 1)], ..Default::default() }
+    }
+
+    #[test]
+    fn prepared_display_reads_all_three_caches_without_cold_geometry_or_quality_changes() {
+        use crate::display_quality::{DisplayQuality, current};
+        let state = state();
+        let body = &state.bodies[0];
+        let quality = DisplayQuality::Fine;
+        let index = quality.index();
+        let current = current();
+        let tolerance = body.display_tol();
+        assert!(body.mesh.get().is_none() && body.plan[index].get().is_none() && body.plan_mesh[index].get().is_none());
+        state.warm_display_at(quality, || true);
+        // Inspect the caches before invoking any consumer that could initialize them.
+        let reference = body.mesh.get().unwrap();
+        let plan = body.plan[index].get().unwrap().as_ref().unwrap();
+        let display = body.plan_mesh[index].get().unwrap().as_ref().unwrap();
+        assert!(Arc::ptr_eq(reference, &body.mesh()));
+        assert!(Arc::ptr_eq(plan, &body.display_plan_at(quality).unwrap()));
+        assert!(Arc::ptr_eq(display, &body.plan_mesh_at(quality).unwrap()));
+        assert_eq!(crate::display_quality::current(), current);
+        assert_eq!(body.display_tol(), tolerance);
+        for other in DisplayQuality::ALL.into_iter().filter(|other| *other != quality) {
+            assert!(body.plan[other.index()].get().is_none() && body.plan_mesh[other.index()].get().is_none());
+        }
+    }
+
+    #[test]
+    fn cancelled_display_preparation_leaves_cold_caches_untouched() {
+        let state = state();
+        state.warm_display_at(crate::display_quality::DisplayQuality::Normal, || false);
+        let body = &state.bodies[0];
+        assert!(body.mesh.get().is_none());
+        assert!(body.plan.iter().all(|slot| slot.get().is_none()));
+        assert!(body.plan_mesh.iter().all(|slot| slot.get().is_none()));
+    }
 }
 
 #[cfg(test)]

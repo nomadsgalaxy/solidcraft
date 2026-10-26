@@ -291,7 +291,15 @@ fn mirror_object_type_switch_back_restores_preselected_feature() {
 
 #[test]
 fn mirror_timeline_click_keeps_picked_feature() {
+    for dock in ["bottom", "left", "under_browser"] {
+        mirror_history_click_keeps_picked_feature(dock);
+    }
+}
+
+fn mirror_history_click_keeps_picked_feature(dock: &str) {
     let (mut h, picked) = mirror_preselection();
+    h.app.run("view.history_layout", json!({"dock": dock})).unwrap();
+    h.frames(4);
     // Mirror moves on to the plane; the objects input takes timeline clicks once it is active.
     h.step(&json!({"click":{"handle":"dialog:Features"}})).unwrap();
     assert_eq!(h.app.dialog.as_ref().unwrap().active, 0);
@@ -303,6 +311,30 @@ fn mirror_timeline_click_keeps_picked_feature() {
     let d = h.app.dialog.as_ref().unwrap();
     assert!(matches!(d.kind, Kind::Mirror));
     assert!(d.inputs[0].items.is_empty());
+}
+
+#[test]
+fn rectangular_pattern_takes_features_from_every_history_layout() {
+    for dock in ["bottom", "left", "under_browser"] {
+        let mut h = Harness::new();
+        h.app.run("view.history_layout", json!({"dock": dock})).unwrap();
+        h.app.run("solid.box", json!({"length": 80, "width": 60, "height": 20})).unwrap();
+        h.app.run("solid.cylinder", json!({"base": [20, 20, 20], "radius": 5, "height": 10, "operation": "join"})).unwrap();
+        let id = h.app.session.doc.find_feature("Cylinder1").unwrap().id;
+        h.app.run("select.clear", json!({})).unwrap();
+        h.app.start("solid.pattern.rectangular");
+        h.frames(4);
+        mirror_object_type(&mut h, "Features");
+        h.step(&json!({"click": {"handle": "timeline:Cylinder1"}})).unwrap();
+
+        let d = h.app.dialog.as_ref().unwrap();
+        assert_eq!(d.inputs[0].items, vec![Sel::Feature { id }], "{dock}: the dialog receives the History feature");
+        assert_eq!(d.active, 0, "{dock}: Features stays active so more features can be picked");
+        assert!(h.app.session.selection.is_empty(), "{dock}: a dialog pick does not replace the ordinary selection");
+        h.app.dialog.as_mut().unwrap().inputs[1].items = vec![Sel::Axis { name: "X".into() }];
+        let commands = apply_commands(&h.app, h.app.dialog.as_ref().unwrap()).unwrap();
+        assert_eq!(commands[0].1["features"], json!(["Cylinder1"]), "{dock}: the command receives the chosen feature");
+    }
 }
 
 form_case!(loft, "solid.loft", ["Operation"]);
@@ -561,6 +593,68 @@ fn face_editor_refills_named_faces_after_sketch_resize() {
         assert_eq!(h.app.session.doc.features.last().unwrap().id, id);
         assert!(h.app.session.model.results.iter().all(|r| r.error.is_none()));
     }
+}
+
+#[test]
+fn draft_uses_the_picked_solid_beside_a_hidden_overlapping_mesh() {
+    use solidcraft_engine::doc::{Document, MeshData, naming};
+
+    let mesh = solidcraft_engine::kernel::box_solid(Vec3::ZERO, Vec3::new(20.0, 20.0, 10.0)).unwrap().tessellate(0.01).unwrap();
+    let mut doc = Document::default();
+    doc.add_feature(
+        FeatureKind::MeshImport {
+            file: "overlapping-box.stl".into(),
+            meshes: vec![MeshData {
+                name: "Hidden mesh".into(),
+                positions: mesh.positions.iter().flat_map(|p| [p.x, p.y, p.z]).collect(),
+                triangles: mesh.triangles.iter().flatten().copied().collect(),
+                color: None,
+            }],
+        },
+        Some("Imported mesh"),
+    )
+    .unwrap();
+    let mut h = Harness::new();
+    h.app.session = Session::new(doc);
+    h.app.run("solid.box", json!({"length":20,"width":20,"height":10})).unwrap();
+    h.app.run("browser.visibility", json!({"items":["Hidden mesh"],"visible":false})).unwrap();
+    let state = h.app.session.world_state();
+    let hidden_mesh = state.body("Hidden mesh").unwrap().mesh();
+    let body = state.bodies.iter().find(|body| !body.body.is_mesh()).unwrap();
+    let target = body.name.clone();
+    let point = Vec3::new(20.0, 10.0, 5.0);
+    let name = naming::face_name_at_body(body, point).unwrap();
+    let (index, _, _) = naming::face_on_body(body, &name, point).unwrap();
+    h.app.session.selection = vec![Sel::Face { body: target.clone(), index, point }];
+    let mut d = Dialog::for_command(&h.app, "solid.draft").unwrap();
+    d.inputs[1].items = vec![Sel::Plane { name: "XY".into() }];
+    d.kind = Kind::Draft { angle: "5 deg".into() };
+    let commands = apply_commands(&h.app, &d).unwrap();
+    assert_eq!(preview_commands(&h.app, &d).unwrap(), commands);
+    let (command, params) = &commands[0];
+    h.app.run(command, params.clone()).unwrap();
+    assert_eq!(params["body"], target);
+    let state = h.app.session.model.state();
+    assert_eq!(state.bodies.len(), 2);
+    assert!(state.body("Hidden mesh").unwrap().body.is_mesh());
+    assert_eq!(state.body("Hidden mesh").unwrap().mesh().positions, hidden_mesh.positions);
+    assert_eq!(state.body("Hidden mesh").unwrap().mesh().triangles, hidden_mesh.triangles);
+    let volume = state.body(&target).unwrap().body.volume_at(0.01).unwrap();
+    assert!((volume - 4000.0).abs() > 50.0, "the picked wall should taper: {volume}");
+    assert!(matches!(
+        &h.app.session.doc.features.last().unwrap().kind,
+        FeatureKind::Draft { body: Some(body), .. } if *body == target
+    ));
+}
+
+#[test]
+fn draft_rejects_faces_from_different_bodies() {
+    let h = Harness::new();
+    let mut d = Dialog::for_command(&h.app, "solid.draft").unwrap();
+    d.inputs[0].items =
+        vec![Sel::Face { body: "First".into(), index: 0, point: Vec3::ZERO }, Sel::Face { body: "Second".into(), index: 0, point: Vec3::X }];
+    d.inputs[1].items = vec![Sel::Plane { name: "XY".into() }];
+    assert_eq!(apply_commands(&h.app, &d).unwrap_err(), "pick faces of one body");
 }
 
 #[test]
