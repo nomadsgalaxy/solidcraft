@@ -19,6 +19,7 @@ pub const DOCUMENTED: &[&str] = &[
     "solid.revolve",
     "solid.shell",
     "solid.sweep",
+    "timeline.play",
 ];
 
 /// The help for `command` in the current language, when it has any.

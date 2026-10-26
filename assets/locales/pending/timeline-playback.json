@@ -1,18 +1,58 @@
 {
-  "de": {
-    "ui.history_play": "Bis zum Ende abspielen",
-    "ui.history_stop": "Wiedergabe stoppen"
-  },
   "en": {
-    "ui.history_stop": "Stop playback"
+    "cmd.timeline_play": "Play History",
+    "cmd.timeline_stop": "Stop History",
+    "help.timeline.play": "Replay the remaining features one at a time, with a half-second pause after each rebuild. Run this command again or press Escape to stop; Go to end jumps immediately.",
+    "ui.history_play_finish_action": "Finish the current action before playing History",
+    "ui.history_play_roll_back": "Move the History marker back before playing"
+  },
+  "ar": {
+    "cmd.timeline_play": "تشغيل السجل",
+    "cmd.timeline_stop": "إيقاف السجل",
+    "help.timeline.play": "أعد تشغيل الميزات المتبقية واحدة تلو الأخرى، مع توقف لمدة نصف ثانية بعد كل إعادة بناء. شغّل هذا الأمر مرة أخرى أو اضغط Escape للإيقاف؛ ينتقل «الذهاب إلى النهاية» فورًا إلى النهاية.",
+    "ui.history_play_finish_action": "أكمل الإجراء الحالي قبل تشغيل السجل",
+    "ui.history_play_roll_back": "أعد مؤشر السجل إلى الخلف قبل التشغيل"
+  },
+  "de": {
+    "cmd.timeline_play": "Verlauf abspielen",
+    "cmd.timeline_stop": "Verlauf anhalten",
+    "help.timeline.play": "Die verbleibenden Features nacheinander abspielen, mit einer halben Sekunde Pause nach jedem Neuaufbau. Diesen Befehl erneut ausführen oder Escape drücken, um anzuhalten; Zum Ende springt sofort ans Ende.",
+    "ui.history_play_finish_action": "Die aktuelle Aktion abschließen, bevor der Verlauf abgespielt wird",
+    "ui.history_play_roll_back": "Die Verlaufsmarkierung vor dem Abspielen zurücksetzen"
+  },
+  "he": {
+    "cmd.timeline_play": "הפעלת ציר הזמן",
+    "cmd.timeline_stop": "עצירת ציר הזמן",
+    "help.timeline.play": "הפעלה מחדש של הפיצ'רים שנותרו, אחד בכל פעם, עם השהיה של חצי שנייה לאחר כל בנייה מחדש. להפסקה יש להפעיל שוב את הפקודה או ללחוץ על Escape; מעבר לסוף מתבצע מיד.",
+    "ui.history_play_finish_action": "יש לסיים את הפעולה הנוכחית לפני הפעלת ציר הזמן",
+    "ui.history_play_roll_back": "יש להזיז את סמן ציר הזמן לאחור לפני ההפעלה"
   },
   "ja": {
-    "ui.history_stop": "再生を停止"
+    "cmd.timeline_play": "履歴を再生",
+    "cmd.timeline_stop": "履歴を停止",
+    "help.timeline.play": "残りのフィーチャを一つずつ再生し、再構築のたびに0.5秒間停止します。このコマンドをもう一度実行するかEscキーで停止し、「最後へ」で直ちに最後へ移動します。",
+    "ui.history_play_finish_action": "現在の操作を完了してから履歴を再生してください",
+    "ui.history_play_roll_back": "再生する前に履歴マーカーを戻してください"
   },
   "ko": {
-    "ui.history_stop": "재생 중지"
+    "cmd.timeline_play": "기록 재생",
+    "cmd.timeline_stop": "기록 재생 중지",
+    "help.timeline.play": "남은 피처를 하나씩 재생하고 각 재생성 후 0.5초 동안 멈춥니다. 이 명령을 다시 실행하거나 Escape 키를 누르면 중지됩니다. 끝으로 이동은 즉시 마지막 단계로 이동합니다.",
+    "ui.history_play_finish_action": "기록을 재생하기 전에 현재 작업을 완료하세요",
+    "ui.history_play_roll_back": "재생하기 전에 기록 마커를 이전 단계로 이동하세요"
+  },
+  "vi": {
+    "cmd.timeline_play": "Phát lịch sử",
+    "cmd.timeline_stop": "Dừng lịch sử",
+    "help.timeline.play": "Phát lại lần lượt các tính năng còn lại, tạm dừng nửa giây sau mỗi lần dựng lại. Chạy lại lệnh này hoặc nhấn Escape để dừng; Đến cuối sẽ chuyển ngay đến cuối lịch sử.",
+    "ui.history_play_finish_action": "Hoàn tất thao tác hiện tại trước khi phát lịch sử",
+    "ui.history_play_roll_back": "Đưa điểm đánh dấu lịch sử lùi lại trước khi phát"
   },
   "zh": {
-    "ui.history_stop": "停止播放"
+    "cmd.timeline_play": "播放历史",
+    "cmd.timeline_stop": "停止历史播放",
+    "help.timeline.play": "逐个播放剩余特征，每次重建后暂停半秒。再次运行此命令或按Escape停止；转到末尾会立即跳转。",
+    "ui.history_play_finish_action": "请先完成当前操作，再播放历史",
+    "ui.history_play_roll_back": "播放前请将历史标记向后移动"
   }
 }

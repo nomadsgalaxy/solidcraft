@@ -978,6 +978,11 @@ impl SolveApp {
         if matches!(id, "file.save_mesh" | "file.send_to_slicer") {
             solidcraft_engine::slicers::set_chosen_programs(&self.preferences.custom_slicers);
         }
+        if id == "timeline.play" {
+            let reply = self.session.execute(id, &params).map_err(|e| e.to_string())?;
+            timeline::request_playback(self, reply.get("action").and_then(Value::as_str).unwrap_or("toggle"))?;
+            return Ok(reply);
+        }
         let t0 = now_ms();
         let revision = self.session.revision;
         let r = self.session.execute(id, &params).map_err(|e| e.to_string());
@@ -1174,11 +1179,17 @@ impl SolveApp {
     }
 
     fn start_with_variant_memory(&mut self, id: &str, remember_variant: bool, opener: Option<egui::Rect>) {
-        timeline::stop_playback(self);
+        if id == "timeline.play" {
+            if let Err(why) = self.run(id, json!({})) {
+                self.set_status(why, true);
+            }
+            return;
+        }
         if id == "ui.palette" {
             shortcut_box::open(self, None);
             return;
         }
+        timeline::stop_playback(self);
         // A file is loading: the design waits for it.
         if self.file_load.busy() || self.file_picker.is_some() {
             return;

@@ -123,6 +123,9 @@ impl SolveApp {
     /// a while (see the module notes). `Ok(Null)` when it is left computing or waiting its turn:
     /// its outcome then shows as any command's does (an error in the status line).
     pub fn run_heavy(&mut self, id: &str, params: Value) -> Result<Value, String> {
+        if id == "timeline.play" {
+            return self.run(id, params);
+        }
         // A manual history action takes over from playback. Playback takes its state out
         // while submitting its own next step, then puts it back to wait for that step.
         crate::timeline::stop_playback(self);

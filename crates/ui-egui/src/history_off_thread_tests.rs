@@ -124,7 +124,7 @@ fn a_parameter_change_computed_off_the_thread_is_not_evaluated_again() {
 fn playback_waits_for_each_background_rebuild_before_timing_the_next_step() {
     let mut h = block_boss_hole();
     h.app.run("timeline.roll_to", json!({"position": 0})).unwrap();
-    crate::timeline::run_transport(&mut h.app, &h.ctx, crate::ui_kit::HistoryTransport::Play);
+    h.app.start("timeline.play");
     h.frames(1);
     for position in 1..=3 {
         assert!(h.app.deferred.is_some(), "step {position} is computed in the background");
@@ -162,13 +162,13 @@ fn interrupted_playback_never_applies_its_pending_background_step() {
     for action in ["stop", "last", "edit", "marker", "tool", "palette", "new"] {
         let mut h = block_boss_hole();
         h.app.run("timeline.roll_to", json!({"position": 0})).unwrap();
-        crate::timeline::run_transport(&mut h.app, &h.ctx, crate::ui_kit::HistoryTransport::Play);
+        h.app.start("timeline.play");
         h.frames(1);
         assert!(h.app.deferred.is_some());
         match action {
-            "stop" => crate::timeline::run_transport(&mut h.app, &h.ctx, crate::ui_kit::HistoryTransport::Play),
+            "stop" => h.app.start("timeline.play"),
             "last" => {
-                crate::timeline::run_transport(&mut h.app, &h.ctx, crate::ui_kit::HistoryTransport::Last);
+                crate::timeline::run_transport(&mut h.app, crate::ui_kit::HistoryTransport::Last);
                 until_settled(&mut h);
                 assert_eq!(marker(&h), None, "Go to end supersedes the pending playback step");
             }
@@ -179,7 +179,11 @@ fn interrupted_playback_never_applies_its_pending_background_step() {
                 h.app.run("timeline.roll_to", json!({"position": 2})).unwrap();
             }
             "tool" => h.app.start("solid.box"),
-            "palette" => h.app.start("ui.palette"),
+            "palette" => {
+                h.app.start("ui.palette");
+                assert!(h.app.timeline_playback.is_some());
+                h.app.start("timeline.play");
+            }
             _ => {
                 h.app.run("file.new", json!({})).unwrap();
             }
