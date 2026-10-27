@@ -8,6 +8,8 @@ use solidcraft_engine::doc::{
     construct::{AxisDef, PointDef},
 };
 
+use solidcraft_engine::schema::edit::PlaybackAction;
+
 use crate::SolveApp;
 use crate::theme::Tokens;
 
@@ -462,8 +464,23 @@ pub(crate) fn playback_command_info(app: &SolveApp, command: &solidcraft_engine:
     info
 }
 
+/// What playback can't run alongside: starting refuses on these, and a running playback stops on them.
+fn playback_blocked(app: &SolveApp) -> bool {
+    app.home.open
+        || crate::render_workspace::active(app)
+        || app.session.active_sketch.is_some()
+        || app.dialog.is_some()
+        || app.tool.is_some()
+        || app.file_load.busy()
+        || app.file_picker.is_some()
+        || app.saving.is_some()
+        || app.applying.is_some()
+        || app.delete_check.is_some()
+        || !app.deferred_queue.is_empty()
+}
+
 fn playback_ready(app: &SolveApp) -> Result<(), String> {
-    if app.computing_since().is_some() || app.dialog.is_some() || app.tool.is_some() || app.home.open || crate::render_workspace::active(app) {
+    if app.computing_since().is_some() || playback_blocked(app) {
         return Err(crate::i18n::tr("ui.history_play_finish_action").into());
     }
     let n = app.session.doc.features.len();
@@ -473,8 +490,8 @@ fn playback_ready(app: &SolveApp) -> Result<(), String> {
     Ok(())
 }
 
-pub(crate) fn request_playback(app: &mut SolveApp, action: &str) -> Result<(), String> {
-    if action == "stop" || (action == "toggle" && app.timeline_playback.is_some()) {
+pub(crate) fn request_playback(app: &mut SolveApp, action: PlaybackAction) -> Result<(), String> {
+    if matches!(action, PlaybackAction::Stop) || (matches!(action, PlaybackAction::Toggle) && app.timeline_playback.is_some()) {
         stop_playback(app);
         return Ok(());
     }
@@ -492,19 +509,7 @@ pub(crate) fn tick_playback(app: &mut SolveApp, ctx: &egui::Context) {
     if app.timeline_playback.is_none() {
         return;
     }
-    if app.home.open
-        || crate::render_workspace::active(app)
-        || app.session.active_sketch.is_some()
-        || app.dialog.is_some()
-        || app.tool.is_some()
-        || app.file_load.busy()
-        || app.file_picker.is_some()
-        || app.saving.is_some()
-        || app.applying.is_some()
-        || app.delete_check.is_some()
-        || !app.deferred_queue.is_empty()
-        || ctx.input(|i| i.key_pressed(egui::Key::Escape))
-    {
+    if playback_blocked(app) || ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
         stop_playback(app);
         return;
     }
@@ -1180,6 +1185,18 @@ mod tests {
             assert_eq!(h.app.session.revision, revision);
             assert!(h.app.timeline_playback.is_none());
         }
+    }
+
+    #[test]
+    fn playback_refuses_to_start_while_other_history_work_waits() {
+        let mut h = two_boxes(false);
+        h.app.run("timeline.roll_to", json!({"position": 0})).unwrap();
+        h.app.deferred_queue.push(("timeline.roll_to".into(), json!({"position": 1})));
+        assert!(h.app.run("timeline.play", json!({"action": "play"})).is_err(), "refused up front, not stopped a frame later");
+        assert!(h.app.timeline_playback.is_none());
+        h.app.deferred_queue.clear();
+        h.app.run("timeline.play", json!({"action": "play"})).unwrap();
+        assert!(h.app.timeline_playback.is_some());
     }
 
     /// A timeline wider than the window scrolls with a plain mouse wheel (#3356).

@@ -980,7 +980,8 @@ impl SolveApp {
         }
         if id == "timeline.play" {
             let reply = self.session.execute(id, &params).map_err(|e| e.to_string())?;
-            timeline::request_playback(self, reply.get("action").and_then(Value::as_str).unwrap_or("toggle"))?;
+            let action = serde_json::from_value(reply["action"].clone()).map_err(|e| e.to_string())?;
+            timeline::request_playback(self, action)?;
             return Ok(reply);
         }
         let t0 = now_ms();
