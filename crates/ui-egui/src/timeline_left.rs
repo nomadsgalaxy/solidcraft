@@ -340,7 +340,8 @@ pub fn left_timeline(app: &mut SolveApp, ui: &mut egui::Ui) {
 
 fn timeline_transport(app: &mut SolveApp, ui: &mut egui::Ui, names: bool) {
     let t = Tokens::get();
-    let count = crate::ui_kit::HistoryTransport::ALL.len() as f32;
+    let mut controls = crate::ui_kit::HistoryTransport::shown(app.preferences.history_play_button);
+    let count = controls.len() as f32;
     let height = if names { crate::ui_kit::TREE_ROW_HEIGHT } else { t.control_height * count + t.space_2 * (count - 1.0) };
     let (header, _) = ui.allocate_exact_size(vec2(ui.available_width(), height), Sense::hover());
     crate::scenario::publish_rect("history:transport", header);
@@ -367,7 +368,11 @@ fn timeline_transport(app: &mut SolveApp, ui: &mut egui::Ui, names: bool) {
                 .layout(egui::Layout::left_to_right(egui::Align::Center)),
         );
         let handle = crate::ui_kit::panel_grip(&mut grip).rect;
-        let controls_width = crate::ui_kit::history_transport_width();
+        // A named column too narrow for five buttons beside its grip leaves Play to the ribbon.
+        if controls_right - crate::ui_kit::history_transport_width(controls.len()) < handle.right() + t.space_2 {
+            controls = &crate::ui_kit::HistoryTransport::ALL;
+        }
+        let controls_width = crate::ui_kit::history_transport_width(controls.len());
         let title = crate::i18n::tr("ui.history_title");
         let galley = ui.painter().layout_no_wrap(title.to_owned(), crate::fonts::semibold(t.font_heading), t.text);
         let text_left = handle.right() + t.space_8;
@@ -384,19 +389,21 @@ fn timeline_transport(app: &mut SolveApp, ui: &mut egui::Ui, names: bool) {
         crate::scenario::publish_handle("history:grip", drag_rect.center());
         dock_drag(app, ui, &drag);
     }
-    for (i, control) in crate::ui_kit::HistoryTransport::ALL.into_iter().enumerate() {
+    for (i, &control) in controls.iter().enumerate() {
         let side = if names { t.space_24 } else { t.control_height };
         let rect = if names {
             Rect::from_min_size(
-                pos2(controls_right - crate::ui_kit::history_transport_width() + i as f32 * (side + t.space_2), header.center().y - side / 2.0),
+                pos2(
+                    controls_right - crate::ui_kit::history_transport_width(controls.len()) + i as f32 * (side + t.space_2),
+                    header.center().y - side / 2.0,
+                ),
                 vec2(side, side),
             )
         } else {
             Rect::from_min_size(pos2(header.center().x - side / 2.0, header.top() + i as f32 * (side + t.space_2)), vec2(side, side))
         };
-        if control.show(ui, rect).clicked() {
-            crate::timeline::run_transport(app, control);
-        }
+        let response = control.show(ui, rect, app.timeline_playback.is_some());
+        crate::timeline::transport_response(app, control, &response);
     }
 }
 

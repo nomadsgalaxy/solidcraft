@@ -21,11 +21,33 @@ pub(crate) fn run_transport(app: &mut SolveApp, control: crate::ui_kit::HistoryT
     let position = match control {
         crate::ui_kit::HistoryTransport::First => 0,
         crate::ui_kit::HistoryTransport::Back => marker.saturating_sub(1),
+        crate::ui_kit::HistoryTransport::Play => {
+            app.start("timeline.play");
+            return;
+        }
         crate::ui_kit::HistoryTransport::Forward => marker.saturating_add(1).min(n),
         crate::ui_kit::HistoryTransport::Last => n,
     };
     let params = if position < n { json!({"position":position}) } else { json!({}) };
     let _ = app.run_heavy("timeline.roll_to", params);
+}
+
+/// A click runs a History control; a right-click offers to show or hide the Play button.
+pub(crate) fn transport_response(app: &mut SolveApp, control: crate::ui_kit::HistoryTransport, response: &egui::Response) {
+    if response.clicked() {
+        run_transport(app, control);
+    }
+    if response.secondary_clicked() {
+        let at = response.interact_pointer_pos().unwrap_or(response.rect.left_bottom());
+        crate::context_menu::open_for(app, at, crate::context_menu::Target::HistoryControls);
+    }
+}
+
+/// The History controls' menu: shows or hides the Play button.
+pub(crate) fn transport_items(app: &SolveApp) -> Vec<crate::context_menu::Item> {
+    let show = !app.preferences.history_play_button;
+    let label = crate::i18n::tr(if show { "ui.history_play_button_show" } else { "ui.history_play_button_hide" });
+    vec![crate::context_menu::Item::action("ui.historyPlayButton", label, "timeline_play").with(json!({ "show": show }))]
 }
 
 /// The feature that made a face, edge or vertex of `body` (its world name): a face's own creator,
@@ -604,7 +626,8 @@ fn timeline_contents(app: &mut SolveApp, ui: &mut egui::Ui, floating: bool) {
     x += t.space_10 + t.space_8;
     let mut drag_rect = grip;
     let label = p.layout_no_wrap(crate::i18n::tr("ui.history_title").to_string(), crate::fonts::semibold(t.font_heading), t.text);
-    if x + label.size().x + t.space_12 + crate::ui_kit::history_transport_width() <= r.right() {
+    let controls = crate::ui_kit::HistoryTransport::shown(app.preferences.history_play_button);
+    if x + label.size().x + t.space_12 + crate::ui_kit::history_transport_width(controls.len()) <= r.right() {
         let title_rect = Rect::from_min_size(pos2(x, r.center().y - label.size().y / 2.0), label.size());
         p.galley(title_rect.min, label.clone(), t.text);
         drag_rect = drag_rect.union(title_rect);
@@ -613,11 +636,10 @@ fn timeline_contents(app: &mut SolveApp, ui: &mut egui::Ui, floating: bool) {
     let response = ui.interact(drag_rect, egui::Id::new("sc_history_dock_grip"), Sense::drag());
     crate::scenario::publish_handle("history:grip", drag_rect.center());
     crate::timeline_left::dock_drag(app, ui, &response);
-    for control in crate::ui_kit::HistoryTransport::ALL {
+    for &control in controls {
         let br = Rect::from_center_size(pos2(x + t.space_24 / 2.0, r.center().y), vec2(t.space_24, t.space_24));
-        if control.show(ui, br).clicked() {
-            run_transport(app, control);
-        }
+        let response = control.show(ui, br, app.timeline_playback.is_some());
+        transport_response(app, control, &response);
         x += t.space_24 + t.space_2;
     }
     x += 14.0;
@@ -1037,8 +1059,7 @@ mod tests {
         h.app.run("timeline.roll_to", json!({"position": 0})).unwrap();
         h.app.ui.tab = "INSPECT".into();
         h.frames(3);
-        assert_eq!(crate::ui_kit::HistoryTransport::ALL.len(), 4);
-        assert!(crate::scenario::handle_at("history:play").is_none());
+        assert!(crate::scenario::handle_at("history:play").is_some(), "Play sits in the History controls by default");
         let command = solidcraft_engine::find_command("timeline.play").unwrap();
         let info = crate::render_workspace::interactive_command_info(&h.app, command);
         assert!(info.enabled);
@@ -1195,6 +1216,58 @@ mod tests {
         h.app.deferred_queue.clear();
         h.app.run("timeline.play", json!({"action": "play"})).unwrap();
         assert!(h.app.timeline_playback.is_some());
+    }
+
+    fn right_click(h: &mut Harness, handle: &str) {
+        let at = crate::scenario::handle_at(handle).unwrap();
+        let button = |pressed| egui::Event::PointerButton { pos: at, button: egui::PointerButton::Secondary, pressed, modifiers: Default::default() };
+        h.frame_with(vec![egui::Event::PointerMoved(at)]);
+        h.frame_with(vec![button(true)]);
+        h.frame_with(vec![button(false)]);
+    }
+
+    /// History shows Play between Previous and Next (#3688); turning it off gives back the four
+    /// controls it had before.
+    #[test]
+    fn the_play_button_plays_and_stops_and_the_controls_menu_hides_it() {
+        use crate::context_menu::Target;
+        for (dock, width) in [("bottom", 130.0), ("left", 56.0), ("left", 320.0)] {
+            let mut h = two_boxes(dock != "bottom");
+            h.app.run("view.history_layout", json!({"dock": dock, "width": width})).unwrap();
+            h.frames(2);
+            assert!(h.app.preferences.history_play_button, "on by default");
+
+            let at = |name: &str| crate::scenario::handle_at(name).unwrap();
+            let (back, play, forward) = (at("history:back"), at("history:play"), at("history:forward"));
+            let across = dock == "bottom" || width > 56.0;
+            if across {
+                assert!(back.x < play.x && play.x < forward.x, "Play sits between Previous and Next; {dock} {width}");
+            } else {
+                assert!(back.y < play.y && play.y < forward.y, "Play sits between Previous and Next; {dock} {width}");
+            }
+
+            h.app.run("timeline.roll_to", json!({"position": 0})).unwrap();
+            h.frames(2);
+            h.step(&json!({"click": {"handle": "history:play"}})).unwrap();
+            assert!(h.app.timeline_playback.is_some(), "the button plays; {dock} {width}");
+            h.step(&json!({"click": {"handle": "history:play"}})).unwrap();
+            assert!(h.app.timeline_playback.is_none(), "and stops; {dock} {width}");
+
+            right_click(&mut h, "history:back");
+            assert!(h.app.viewport.context_menu.is_some() && h.app.menu.target == Target::HistoryControls, "{dock} {width}");
+            let items = crate::context_menu::items(&h.app, &Target::HistoryControls);
+            assert_eq!(items[0].label, crate::i18n::tr("ui.history_play_button_hide"));
+            crate::context_menu::run_item(&mut h.app, &items[0], egui::Pos2::ZERO);
+            assert!(!h.app.preferences.history_play_button);
+            h.frames(2);
+            assert!(crate::scenario::handle_at("history:play").is_none(), "the four controls again; {dock} {width}");
+
+            let items = crate::context_menu::items(&h.app, &Target::HistoryControls);
+            assert_eq!(items[0].label, crate::i18n::tr("ui.history_play_button_show"));
+            crate::context_menu::run_item(&mut h.app, &items[0], egui::Pos2::ZERO);
+            h.frames(2);
+            assert!(crate::scenario::handle_at("history:play").is_some(), "and Play back; {dock} {width}");
+        }
     }
 
     /// A timeline wider than the window scrolls with a plain mouse wheel (#3356).

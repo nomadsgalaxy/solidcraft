@@ -681,6 +681,9 @@ preference_settings! {
     /// While a dialog or a sketch is open, OK and Cancel in the view's top right corner, with the
     /// axis view moved down below them (#6709). Off by default.
     view_confirm_corner: bool = false, PAGE_INTERFACE => check_id("prefs.view_confirm_corner");
+    /// A Play History button in the History controls, between Previous and Next (#3688). Off
+    /// gives the four controls History had before; right-clicking the controls toggles it too.
+    history_play_button: bool = true, PAGE_INTERFACE => check_id("prefs.history_play_button");
     /// Put the feature history to the left of the browser instead of below the viewport.
     timeline_left: bool = false, PAGE_INTERFACE;
     /// Measured outer width; the contents react to this width without a names mode.
@@ -3618,6 +3621,7 @@ mod tests {
             ("color_vision", json!("protan"), PAGE_INTERFACE),
             ("viewport_theme", json!("light"), PAGE_INTERFACE),
             ("view_confirm_corner", json!(true), PAGE_INTERFACE),
+            ("history_play_button", json!(false), PAGE_INTERFACE),
             ("nav", json!("blender"), PAGE_NAVIGATION),
             ("look_at_anim", json!(false), PAGE_NAVIGATION),
             ("selection_shift_add_only", json!(true), PAGE_SKETCH),
