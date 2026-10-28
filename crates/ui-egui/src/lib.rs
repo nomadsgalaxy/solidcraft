@@ -1034,11 +1034,11 @@ impl SolveApp {
         let revision = self.session.revision;
         let selected_before = self.session.selection.clone();
         let r = self.session.execute(id, &params).map_err(|e| e.to_string());
+        self.big_operation |= now_ms() - t0 >= recovery_ui::BIG_OPERATION_MS;
+        let done = self.command_completed(id, r);
         if self.session.revision != revision {
             timeline::stop_playback(self);
         }
-        self.big_operation |= now_ms() - t0 >= recovery_ui::BIG_OPERATION_MS;
-        let done = self.command_completed(id, r);
         // Render focus already applies its semantic selection after clearing object picks.
         if done.is_ok()
             && id != "view.render_select"
