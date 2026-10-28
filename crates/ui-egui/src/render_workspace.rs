@@ -43,6 +43,9 @@ mod materials;
 #[path = "render_workspace_setups.rs"]
 mod setups;
 
+#[path = "render_workspace_shots.rs"]
+pub(crate) mod shots;
+
 #[path = "render_ui/scene.rs"]
 pub(crate) mod scene;
 
@@ -51,6 +54,9 @@ mod studio;
 #[path = "render_workspace_transport.rs"]
 mod transport;
 
+#[path = "render_workspace_thumbnails.rs"]
+mod thumbnails;
+
 #[cfg(test)]
 #[path = "render_workspace_tests.rs"]
 mod tests;
@@ -58,6 +64,7 @@ mod tests;
 type PathFactory = Box<dyn FnOnce() -> Result<ImageHost, String> + Send>;
 
 pub struct State {
+    thumbnails: thumbnails::Cache,
     pending_setup: Option<PathFactory>,
     pub host: Option<ExecutorDescriptor>,
     pub path_host: PathHost,
@@ -259,6 +266,8 @@ pub enum RenderSelection {
 /// Small per-document editor state; GPU uploads and host capabilities stay outside tabs.
 #[derive(Clone, Debug)]
 pub struct ViewState {
+    job_shot: Option<String>,
+    save_shot_name: Option<String>,
     pub name: String,
     pub selection: RenderSelection,
     pub(crate) stage: Stage,
@@ -318,6 +327,8 @@ impl ImageMethod {
 impl Default for ViewState {
     fn default() -> Self {
         Self {
+            job_shot: None,
+            save_shot_name: None,
             name: "Studio".into(),
             selection: RenderSelection::Nothing,
             stage: Stage::Look,
@@ -353,6 +364,7 @@ impl Default for ViewState {
 impl Default for State {
     fn default() -> Self {
         Self {
+            thumbnails: Default::default(),
             host: None,
             path_host: PathHost::default(),
             pending_setup: None,
@@ -521,6 +533,7 @@ pub(crate) fn invalidate_images(app: &mut SolveApp) {
 }
 
 pub fn invalidate_scene(app: &mut SolveApp) {
+    app.render_workspace.thumbnails = Default::default();
     app.render_workspace.revision = u64::MAX;
     app.render_workspace.scene_signature = None;
     app.render_workspace.scene = None;
@@ -1795,6 +1808,7 @@ pub fn show(app: &mut SolveApp, ui: &mut egui::Ui) {
             outline: false,
             // Product rendering has its own lighting; AO is a Design viewport setting.
             ao_radius: 0.0,
+            ao_samples: solidcraft_gpu::view::AO_SAMPLES,
             eye: [eye.x as f32, eye.y as f32, eye.z as f32, if camera.fov > 0.0 { 1.0 } else { 0.0 }],
             ssaa: if width < full.0 { width as f32 / full.0 as f32 } else { 1.0 },
             hover_tint: [f32::from(Tokens::get().hover_face_lift) / 255.0; 3],
@@ -1814,7 +1828,13 @@ pub fn show(app: &mut SolveApp, ui: &mut egui::Ui) {
 }
 
 pub(crate) fn interactive_command_info(app: &SolveApp, command: &solidcraft_engine::CommandSpec) -> solidcraft_engine::CommandInfo {
-    ribbon::command_info(app, command)
+    let mut info = ribbon::command_info(app, command);
+    // A drawing tool on the SKETCH tab kept shown outside a sketch starts one (#7904).
+    if crate::workspace::starts_a_sketch(app, command.id) {
+        info.enabled = true;
+        info.disabled_reason = None;
+    }
+    info
 }
 pub(crate) fn start_interactive(app: &mut SolveApp, id: &str) -> bool {
     ribbon::start(app, id)

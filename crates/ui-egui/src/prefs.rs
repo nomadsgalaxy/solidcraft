@@ -812,6 +812,9 @@ preference_settings! {
     frame_rate_details: bool = false, PAGE_GRAPHICS;
     /// Draw a wider rim under finished sketch curves to improve contrast on shaded faces.
     sketch_halo: bool = false, PAGE_GRAPHICS => check("Halo under sketch curves");
+    /// Show the view's pitch, yaw and roll and its projection under the orientation gizmo (#6032).
+    /// Off by default; View ▸ View angles and `view.angle_readout` turn it on.
+    show_view_angles: bool = false, PAGE_GRAPHICS;
     /// Show world X/Y/Z component dimensions beside the total distance in Measure.
     measure_axis_distances: bool = true, PAGE_GRAPHICS => check_id("settings.measure_axis_distances");
     /// Decimals shown for lengths and angles.
@@ -830,6 +833,8 @@ preference_settings! {
     /// The 3D view's colours: the theme's own, or the Light or Dark theme's whatever the window
     /// uses (#4146).
     viewport_theme: crate::theme::ViewportTheme = crate::theme::ViewportTheme::Theme, PAGE_INTERFACE;
+    /// The application bar's logo in the theme's accent instead of the theme's logo colours.
+    logo_accent: bool = false, PAGE_INTERFACE;
     /// Imported theme files (`theme_files`), kept here so they also work in the browser.
     custom_themes: Vec<crate::theme_files::ThemeFile> = Vec::new();
     /// Desktop: a `solidcraft-theme/1` file another tool writes, followed as the theme and
@@ -844,6 +849,9 @@ preference_settings! {
     navigation_bar: crate::navigation_bar::NavigationBar = Default::default(), PAGE_INTERFACE;
     /// Show command names beneath ribbon icons, independently of workspace layout.
     ribbon_labels: bool = true, PAGE_INTERFACE;
+    /// Keep the SKETCH tab in the ribbon, right after MODEL, while no sketch is open; its drawing
+    /// tools then start a sketch first (#7904).
+    sketch_tab_always: bool = false, PAGE_INTERFACE => check_id("prefs.sketch_tab_always");
     /// Where a dialog's OK and Cancel sit: under its inputs (the default) or in its title row (#6708).
     dialog_buttons: crate::ui_kit::DialogButtons = Default::default(), PAGE_INTERFACE;
     /// Interface scale (1 = 100 %).
@@ -905,6 +913,8 @@ preference_settings! {
     trackpad_pan: bool = true, PAGE_NAVIGATION;
     /// Horizontal trackpad and thumb-wheel scrolling pans the view the other way (#2007).
     pan_reverse_x: bool = false, PAGE_NAVIGATION => check("Reverse horizontal pan direction", "Horizontal two-finger scrolling and the thumb wheel pan the other way");
+    /// Vertical trackpad scrolling pans the view the other way (#5240).
+    pan_reverse_y: bool = false, PAGE_NAVIGATION => check("Reverse vertical pan direction", "Vertical two-finger scrolling pans the other way");
     /// View changes (axis view, Look At, Home) animate; `look_at_speed` scales how fast.
     look_at_anim: bool = true, PAGE_NAVIGATION => check("Animate view changes", "Axis view, Look At, Home and Fit");
     look_at_speed: f32 = 1.0, PAGE_NAVIGATION, accept(0.25..=4.0) => enabled_slider(look_at_anim, "Animation speed", 0.5..=3.0, 0.25, |v| format!("{v:.2}×"));
@@ -1025,6 +1035,20 @@ preference_settings! {
     shortcut_cycles_modes: bool = false, PAGE_SKETCH;
     /// Where the view goes when a sketch ends (#7038). Keep (the default) leaves it as it is.
     sketch_exit_view: SketchExitView = SketchExitView::default(), PAGE_SKETCH;
+    /// A shape drawn in a sketch gets all its dimensions at once: the typed values, and every
+    /// other size the shape has at its size as drawn (`sketch.draw.dimensioned` with `as_drawn`).
+    /// Shapes `solidcraft_engine::dimension_roles` doesn't list are drawn as before.
+    sketch_auto_dimensions: bool = false, PAGE_SKETCH => check(
+        "Dimension new shapes",
+        "Each shape you draw gets all its dimensions, at the sizes you drew (typed values win). A size the sketch already sets is left out."
+    );
+    /// With `sketch_auto_dimensions`: new shapes are also placed from the sketch origin until they
+    /// are fully constrained (`sketch.draw.dimensioned` with `locate`). A shape already anchored to
+    /// the origin or to placed geometry gets nothing more.
+    sketch_auto_locate: bool = false, PAGE_SKETCH => check(
+        "Also place them from the origin (fully constrained)",
+        "Each new shape is also dimensioned from the sketch origin until nothing of it is left free. A shape already attached to the origin or to placed geometry gets none."
+    );
     /// When true: Shift+click adds without removing; Primary toggles.
     /// When false (default): Shift and Primary both toggle.
     selection_shift_add_only: bool = false, PAGE_SKETCH;
@@ -1506,6 +1530,9 @@ pub fn apply(app: &mut SolveApp, ctx: &egui::Context) {
     if crate::theme::set_custom(custom) {
         app.styled = false;
     }
+    if crate::theme::set_logo_accent(app.preferences.logo_accent) {
+        app.styled = false;
+    }
     // egui's end-of-frame shortcuts only change its context; the saved preference would
     // overwrite that change next frame. Consume the desktop shortcuts into the preference.
     if ctx.options(|o| o.zoom_with_keyboard) && !crate::keymap::capturing(app) {
@@ -1583,6 +1610,11 @@ pub fn nav_mode(app: &SolveApp, button: NavButton, mods: Modifiers) -> Option<Na
 /// +1, or −1 when horizontal scrolling pans the other way (#2007).
 pub fn pan_sign_x(app: &SolveApp) -> f32 {
     if app.preferences.pan_reverse_x { -1.0 } else { 1.0 }
+}
+
+/// +1, or −1 when vertical scrolling pans the other way.
+pub fn pan_sign_y(app: &SolveApp) -> f32 {
+    if app.preferences.pan_reverse_y { -1.0 } else { 1.0 }
 }
 
 /// Whether the configured suppress-snap chord is held.
@@ -4250,6 +4282,7 @@ mod tests {
             ("ui_font", json!("test font"), PAGE_INTERFACE),
             ("layout", json!("compact"), PAGE_INTERFACE),
             ("ribbon_labels", json!(false), PAGE_INTERFACE),
+            ("sketch_tab_always", json!(true), PAGE_INTERFACE),
             ("dialog_buttons", json!("top"), PAGE_INTERFACE),
             ("timeline_left", json!(true), PAGE_INTERFACE),
             ("timeline_under_browser", json!(true), PAGE_INTERFACE),
@@ -5413,6 +5446,23 @@ mod tests {
     }
 
     #[test]
+    fn pan_reverse_y_defaults_off_persists_and_flips_the_sign() {
+        assert!(!serde_json::from_value::<Prefs>(json!({})).unwrap().pan_reverse_y);
+        let mut app = SolveApp::new(solidcraft_engine::Session::default(), Default::default());
+        assert_eq!(pan_sign_y(&app), 1.0);
+        set(&mut app, &json!({"pan_reverse_y": true})).unwrap();
+        assert_eq!(pan_sign_y(&app), -1.0);
+        assert_eq!(pan_sign_x(&app), 1.0);
+        set(&mut app, &json!({"pan_reverse_x": true, "pan_reverse_y": false})).unwrap();
+        assert_eq!(pan_sign_x(&app), -1.0);
+        assert_eq!(pan_sign_y(&app), 1.0);
+        set(&mut app, &json!({"pan_reverse_y": true})).unwrap();
+        let mut other = SolveApp::new(solidcraft_engine::Session::default(), Default::default());
+        other.load_prefs(&app.prefs());
+        assert!(other.preferences.pan_reverse_y);
+    }
+
+    #[test]
     fn trackpad_pan_defaults_on_persists_and_follows_dialog_buttons() {
         assert!(serde_json::from_value::<Prefs>(json!({})).unwrap().trackpad_pan);
         assert!(Prefs::default().trackpad_pan);
@@ -5782,6 +5832,16 @@ mod ui_scale_regression_tests {
         h.call("ui.prefs", json!({"button":"cancel"}));
         assert_eq!(h.app.preferences.ui_scale, 1.0, "Cancel restores the original scale");
         assert_eq!(h.ctx.zoom_factor(), 1.0);
+    }
+}
+
+/// View ▸ View angles and Preferences ▸ Graphics run the same command (#6032).
+pub(crate) fn view_angles_checkbox(app: &mut SolveApp, ui: &mut egui::Ui) {
+    let mut enabled = app.preferences.show_view_angles;
+    let response = ui_kit::checkbox(ui, crate::i18n::tr("ui.view_angles"), &mut enabled).on_hover_text(crate::i18n::tr("ui.view_angles_help"));
+    crate::scenario::publish_handle("view:view_angles", response.rect.center());
+    if response.changed() {
+        let _ = app.run("view.angle_readout", json!({"enabled": enabled}));
     }
 }
 
