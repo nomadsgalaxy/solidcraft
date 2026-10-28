@@ -103,7 +103,11 @@
   the dialog's title row, right of the title, where they stay while sections open and close;
   Cancel then also takes the place of the close button. Enter and Esc work as before.
 - **Timeline** (bottom). Every feature in order. Double-click to edit, drag the marker to roll
-  back, and drag features to reorder them. Preferences can put the timeline vertically at the
+  back, and drag features to reorder them. A sketch's icon, here and in the browser, takes the
+  colour of its state: the sketch colour while it is under constrained, the fully constrained
+  colour, or red while its constraints conflict; its tooltip names the state (Preferences ›
+  Sketch › **Sketch icons in the colour of their state**, on by default, turns this off).
+  Preferences can put the timeline vertically at the
   far left of the viewport, beside the browser. Its seam handle switches between icon
   chips and compact feature names; the browser can collapse to a rail beside either width.
   Docked under the browser, the two share the column: drag the seam between them to give either
@@ -122,6 +126,12 @@
   selects it, and while the marker sits between a sketch and its feature, or the two are in
   different folders, the sketch keeps a row of its own. The timeline along the bottom always lists
   features in creation order.
+- **Status bar** (off by default: Preferences › Interface › **Status bar**). A thin bar along
+  the window's bottom edge, below the timeline. From the right: the design's units (click them
+  to change the design's units, one undo step), the open sketch's state in its colour (under
+  constrained with its degrees of freedom, fully constrained, constraints conflict) and what is
+  being edited (Editing Sketch1, or Editing Extrude1 while that feature's dialog is open). While
+  it is on, the sketch's state no longer shows in the view's top-left corner.
 - **Command search (S).** Click the ribbon search field or press S to open the search popup
   below it. Results group commands by their ribbon path and show matching features and user
   parameters from this design. With an empty query, recent commands appear first, followed by
@@ -230,7 +240,10 @@ pills when `on_accent` has less than 4.5:1 contrast with the fill. See the
 
 - **Import…** adds a theme file and turns it on. Importing a file with the same name again updates
   that theme. A file with an unknown colour name or a malformed colour is refused, and the message
-  names every problem.
+  names every problem. A theme shared as text imports the same way without a file: with the
+  Interface page open, press Ctrl+V (Cmd+V on a Mac), or right-click the Import tile and choose
+  **Paste theme**. Pasted text that isn't a theme is left alone. A theme file dropped on the tile
+  imports too.
 - **Export…** saves the theme on now as a complete file listing every colour and radius. It is a good starting
   point for your own theme.
 - **Remove** deletes the selected imported theme.

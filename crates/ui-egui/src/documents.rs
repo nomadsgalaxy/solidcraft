@@ -31,6 +31,9 @@ pub struct DocSlot {
     view: DocView,
     occurrence_move: Option<crate::browser::OccMove>,
     agent_chat: crate::agent_chat::AgentChat,
+    /// Its linked design files as the design last read them (`Documents::link_stamps`).
+    link_stamps: Vec<(u64, crate::linked_source::Stamp)>,
+    edit_in_place: Option<crate::edit_in_place::PartContext>,
 }
 
 /// The per-design part of the UI state the session doesn't keep (what is hidden, shown or locked
@@ -60,6 +63,8 @@ impl DocSlot {
             view: DocView::default(),
             occurrence_move: None,
             agent_chat: Default::default(),
+            link_stamps: Vec::new(),
+            edit_in_place: None,
         }
     }
 }
@@ -81,6 +86,11 @@ pub struct Documents {
     /// is closed first, so the ones before it keep their places). One with unsaved changes asks
     /// first; Cancel stops the rest (#3055).
     pub batch: Option<Vec<usize>>,
+    /// The shown design's linked design files as it last read them: their modification time and
+    /// size when Update Links last read each without an error, or when the design first showed
+    /// the link (opened, adopted in place, the link just made).
+    /// Coming back to its tab reads again those that differ (`linked_source::update_changed`).
+    pub(crate) link_stamps: Vec<(u64, crate::linked_source::Stamp)>,
 }
 
 impl Documents {
@@ -155,6 +165,8 @@ fn swap_in(app: &mut SolveApp, mut slot: DocSlot) -> DocSlot {
         view: take_view(app),
         occurrence_move: std::mem::replace(&mut app.tree.occurrence_move, slot.occurrence_move),
         agent_chat: slot.agent_chat,
+        link_stamps: std::mem::replace(&mut app.docs.link_stamps, slot.link_stamps),
+        edit_in_place: std::mem::replace(&mut app.edit_in_place.active, slot.edit_in_place),
     };
     // Only the displayed design owns the process-wide crash replay journal.
     app.session.crash_journal = out.session.crash_journal;
@@ -210,12 +222,64 @@ pub fn switch(app: &mut SolveApp, i: usize) {
         return;
     }
     let Some(incoming) = app.docs.slots.get_mut(i).and_then(Option::take) else { return };
+    crate::linked_source::note_unread(app);
     let out = swap_in(app, incoming);
     let a = app.docs.active;
     if let Some(s) = app.docs.slots.get_mut(a) {
         *s = Some(out);
     }
     app.docs.active = i;
+    // Closing several tabs, quitting, or a "save changes?" for this tab goes through them, and a
+    // save then must not wait for a read: what they missed waits for their return.
+    // An assembly reading its links for a part edited in place takes them all up once it is done.
+    if app.docs.batch.is_none()
+        && app.docs.quitting.is_none()
+        && app.docs.closing.is_none()
+        && crate::edit_in_place::refreshing_assembly(app).is_none()
+    {
+        crate::linked_source::update_changed(app);
+    }
+    crate::edit_in_place::attach(app);
+}
+
+/// The open design saved at `path`, shown or in the background.
+pub(crate) fn session_at<'a>(app: &'a SolveApp, path: &str) -> Option<&'a Session> {
+    let saved_at = |s: &Session| s.path.as_deref().is_some_and(|p| same_path(p, path));
+    if saved_at(&app.session) {
+        return Some(&app.session);
+    }
+    app.docs.slots.iter().flatten().map(|s| &s.session).find(|s| saved_at(s))
+}
+
+/// Every edit in place: of the tab shown, and of the tabs in the background.
+pub(crate) fn edits_mut(app: &mut SolveApp) -> Vec<&mut crate::edit_in_place::PartContext> {
+    let mut edits: Vec<_> = app.docs.slots.iter_mut().flatten().filter_map(|s| s.edit_in_place.as_mut()).collect();
+    edits.extend(app.edit_in_place.active.as_mut());
+    edits
+}
+
+/// The open design saved at `path` read every link again without an error, from the files as
+/// `stamps` found them: its record of them (`Documents::link_stamps`, or its tab's) is now that.
+pub(crate) fn record_stamps_at(app: &mut SolveApp, path: &str, stamps: &[(u64, crate::linked_source::Stamp)]) {
+    let record = if app.session.path.as_deref().is_some_and(|p| same_path(p, path)) {
+        &mut app.docs.link_stamps
+    } else {
+        let saved_at = |s: &DocSlot| s.session.path.as_deref().is_some_and(|p| same_path(p, path));
+        let Some(slot) = app.docs.slots.iter_mut().flatten().find(|s| saved_at(s)) else { return };
+        &mut slot.link_stamps
+    };
+    for (c, s) in stamps {
+        crate::linked_source::record(record, *c, *s);
+    }
+}
+
+/// [`session_at`], to change it.
+pub(crate) fn session_at_mut<'a>(app: &'a mut SolveApp, path: &str) -> Option<&'a mut Session> {
+    let saved_at = |s: &Session| s.path.as_deref().is_some_and(|p| same_path(p, path));
+    if saved_at(&app.session) {
+        return Some(&mut app.session);
+    }
+    app.docs.slots.iter_mut().flatten().map(|s| &mut s.session).find(|s| saved_at(s))
 }
 
 /// Select an already-open saved design without reloading or framing it. Identity is derived
@@ -240,7 +304,7 @@ pub(crate) fn reuse_path(app: &mut SolveApp, path: &str) -> Result<bool, String>
     Ok(true)
 }
 
-fn same_path(a: &str, b: &str) -> bool {
+pub(crate) fn same_path(a: &str, b: &str) -> bool {
     if a == b {
         return true;
     }
@@ -294,6 +358,9 @@ pub fn adopt(app: &mut SolveApp, session: Session) {
         app.menu.props = None;
         crate::sketch_attachment_ui::clear(app);
         app.session.replace_design(session);
+        // The blank design's record of its links goes with it; the new one's start now.
+        app.docs.link_stamps.clear();
+        crate::linked_source::note_unread(app);
         crate::render_workspace::reset_document(app);
         app.session.invalidate_view(rev);
         app.cam = Camera::default();
@@ -387,6 +454,7 @@ pub fn close(app: &mut SolveApp, i: usize, force: bool) {
         app.fit_view();
         put_view(app, DocView::default());
         app.docs = Documents::default();
+        app.edit_in_place = Default::default();
         app.home.open = true;
         return;
     }
@@ -442,18 +510,23 @@ fn batch_step(app: &mut SolveApp) {
     if app.docs.closing.is_some() || app.docs.quitting.is_some() {
         return;
     }
-    let Some(mut left) = app.docs.batch.take() else { return };
-    while let Some(i) = left.pop() {
+    if app.docs.batch.is_none() {
+        return;
+    }
+    // The tabs left stay in `batch` while each closes, so the tabs shown on the way know it.
+    while let Some(i) = app.docs.batch.as_mut().and_then(Vec::pop) {
         if i >= app.docs.count() {
             continue;
         }
         if dirty(app, i) {
             app.docs.closing = Some(i);
-            app.docs.batch = Some(left);
             return;
         }
         close(app, i, true);
     }
+    app.docs.batch = None;
+    // The tab left in front reads now what it skipped on the way.
+    crate::linked_source::update_changed(app);
 }
 
 /// Quit (the title bar's ×, File ▸ Quit, the window being closed): asks "save changes?" for each
@@ -805,6 +878,9 @@ pub fn tabs(app: &mut SolveApp, ui: &mut egui::Ui, r: Rect, x0: f32, x1: f32) {
                     let mut chosen = None;
                     for (id, label) in items {
                         let mut item = crate::context_menu::Item::action(id, label, "");
+                        if id == "ui.closeTab" && i == app.docs.active {
+                            item = item.key("Ctrl+W");
+                        }
                         item.enabled = id != "ui.closeOtherTabs" || n > 1;
                         let top = ui.cursor().top();
                         let row = crate::context_menu::list_row(ui, &item);
@@ -1005,6 +1081,8 @@ pub fn answer_prompt(app: &mut SolveApp, answer: Answer) {
             app.docs.closing = None;
             app.docs.quitting = None;
             app.docs.batch = None;
+            // The tab left in front was shown on the way without reading what it missed.
+            crate::linked_source::update_changed(app);
         }
     }
     quit_step(app);
@@ -1021,12 +1099,14 @@ pub(crate) fn saved_for_close(app: &mut SolveApp) {
     if app.docs.quitting.is_some() {
         if !saved {
             app.docs.quitting = None;
+            crate::linked_source::update_changed(app);
         }
     } else if saved {
         close(app, app.docs.active, true);
     } else {
-        // Save As cancelled: the tabs not closed yet stay.
+        // Save As cancelled: the tabs not closed yet stay, the one in front reads what it missed.
         app.docs.batch = None;
+        crate::linked_source::update_changed(app);
     }
     quit_step(app);
     batch_step(app);
@@ -1352,6 +1432,37 @@ mod tests {
         h.app.synthetic.extend([escape, egui::Event::PointerMoved(t1), button(t1, false)]);
         h.frames(16);
         assert_eq!(h.app.docs.active, 2, "Escape put it back");
+    }
+
+    /// #5366: Ctrl+W closes the design shown: a saved one at once (the last one leaves the start
+    /// page), an unsaved one after "save changes?", and on the start page it does nothing (the
+    /// browser closes its tab there).
+    #[test]
+    fn ctrl_w_closes_the_design_shown() {
+        let mut h = crate::scenario::Harness::new();
+        h.app.home.open = false;
+        h.app.run("solid.box", json!({"length": 10, "width": 10, "height": 10})).unwrap();
+        new_design(&mut h.app);
+        h.app.run("solid.sphere", json!({"diameter": 8})).unwrap();
+        h.app.session.mark_saved();
+        assert_eq!(h.app.docs.count(), 2);
+        h.frames(2);
+        h.step(&json!({"key": "W", "cmd": true})).unwrap();
+        h.frames(2);
+        assert_eq!((h.app.docs.count(), h.app.docs.closing), (1, None), "the saved design closed without asking");
+        assert!(!h.app.home.open, "the other design is shown");
+
+        h.step(&json!({"key": "W", "cmd": true})).unwrap();
+        h.frames(2);
+        assert_eq!((h.app.docs.count(), h.app.docs.closing), (1, Some(0)), "the unsaved one asks first");
+        answer_prompt(&mut h.app, Answer::DontSave);
+        assert!(active_is_blank(&h.app) && h.app.home.open, "the last one closed: the start page");
+
+        let revision = h.app.session.revision;
+        h.step(&json!({"key": "W", "cmd": true})).unwrap();
+        h.frames(2);
+        assert_eq!((h.app.docs.closing, h.app.session.revision), (None, revision), "the start page has nothing to close");
+        assert!(h.app.home.open);
     }
 
     #[test]

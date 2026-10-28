@@ -345,6 +345,7 @@ mod primitive_points;
 mod rim_cut;
 mod robustness;
 mod robustness_goldens;
+mod rounded_loft_face;
 mod sphere_lens;
 mod spiral_join;
 mod step_import_options;
@@ -708,6 +709,10 @@ pub(crate) fn hostile_values() -> Vec<Value> {
         json!("mm = 5"),
         json!("w = w"),
         json!("w == 1/0"),
+        // Every value input reads `name = expression` (#4071).
+        json!("a = = 3"),
+        json!("é = 1e308 * 10"),
+        json!(format!("{} = 1", "n".repeat(5000))),
         json!([]),
         json!([1e308, -1e308]),
         json!([0, 0, 0]),
@@ -892,6 +897,33 @@ fn hostile_params_never_panic() {
         workers.into_iter().flat_map(|w| w.join().unwrap()).collect()
     });
     assert!(internal.is_empty(), "commands panicked:\n{}", internal.join("\n"));
+}
+
+/// #6651: a list parameter of the wrong type is refused, not read as an empty list. An empty
+/// list means "every body" to most commands, so a number, an object or a list with a number in
+/// it was read as no list at all: a cut meant for one body cut every body it touched, and the
+/// command reported success.
+///
+/// `null` is not in this list: the schema contract declares these parameters optional and
+/// reads `null` as absent, so it keeps the meaning it always had (no list given).
+#[test]
+fn a_list_parameter_of_the_wrong_type_is_refused() {
+    let mut s = Session::default();
+    run(&mut s, "solid.box", json!({"corner": [0, 0, 0], "length": 40, "width": 30, "height": 10, "body_name": "Plate"}));
+    run(&mut s, "solid.box", json!({"corner": [60, 0, 0], "length": 10, "width": 10, "height": 20, "body_name": "Block"}));
+    let before = volume(&mut s);
+    // A tool crossing both bodies, meant for the Block only.
+    for targets in [json!(7), json!(true), json!({"body": "Block"}), json!(["Block", 42])] {
+        let params =
+            json!({"corner": [35, 2, -1], "length": 30, "width": 3, "height": 30, "operation": "cut", "body_name": "Slot", "targets": targets});
+        let err = s.execute("solid.box", &params).expect_err("a list parameter of the wrong type is refused");
+        let EngineError::BadParams { cmd, msg } = &err else {
+            panic!("{params}: {err}");
+        };
+        assert_eq!(cmd, "solid.box", "{params}: {err}");
+        assert!(msg.contains("targets"), "{params}: {err}");
+        assert_eq!(volume(&mut s), before, "{params}: the design changed");
+    }
 }
 
 #[test]

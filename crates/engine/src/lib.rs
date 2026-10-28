@@ -43,7 +43,8 @@ use solidcraft_doc::{Document, Model, ModelState};
 use solidcraft_geom::Vec3;
 
 pub use cmd::{
-    CommandInfo, CommandSpec, auto_operation, command_specs, dimension_roles, extrude_reach, find_command, resolve_design_links, standard_view,
+    Addition, CommandInfo, CommandSpec, addition, auto_operation, command_specs, dimension_roles, extrude_reach, find_command, resolve_design_links,
+    shown_scope, standard_view,
 };
 pub use solidcraft_doc as doc;
 pub use solidcraft_doc::Visibility;
@@ -643,6 +644,19 @@ impl Session {
         self.saved_visibility = self.visibility.clone();
     }
 
+    /// The name Save As offers for the design's file, without its extension: the name of the
+    /// file it was opened from or last saved to, unless the design has been renamed since, and
+    /// the design's own name otherwise. The name stored in a file need not be the file's: a
+    /// design named `Plate` saved as `Plate-a.sc` and copied to `Plate-b.sc` is `Plate` in both,
+    /// and offering `Plate.sc` for each invites replacing one file with the other (#8329).
+    pub fn save_as_name(&self) -> String {
+        let stem = self.path.as_deref().and_then(|p| std::path::Path::new(p).file_stem()).map(|s| s.to_string_lossy().trim().to_string());
+        match stem {
+            Some(stem) if !stem.is_empty() && self.doc.name == self.saved.name => stem,
+            _ => self.doc.name.clone(),
+        }
+    }
+
     pub fn render_backend(&self) -> render::BackendDescriptor {
         let mut backend = render::builtin_backend();
         if let Some(viewport) = &self.render_viewport {
@@ -1185,6 +1199,19 @@ impl Session {
                 Err(EngineError::Internal(spec.id.to_string(), msg))
             }
         };
+        // A value typed as `name = expression` defines the user parameter `name` (#4071), in the
+        // same undo step; a refused definition fails the command, which leaves the design as it was.
+        let r = match r {
+            Ok((v, live_edit)) if params::has_definition(params) => self.define_inline(spec.id, v).map(|v| (v, live_edit)),
+            r => r,
+        };
+        // A parameter error that did not name the command names it here: the engine knows which
+        // command ran, and the reader of the parameters may not (#6651).
+        let r = match r {
+            Ok(r) => Ok(r),
+            Err(EngineError::BadParams { cmd, msg }) if cmd.is_empty() => Err(EngineError::BadParams { cmd: spec.id.to_string(), msg }),
+            Err(e) => Err(e),
+        };
         // New/open/recover can replace the Session. Device ownership belongs to the host,
         // so its capability metadata survives those document lifecycle commands.
         self.render_viewport = host_viewport;
@@ -1263,6 +1290,20 @@ impl Session {
             crash::command_done(self.crash_journal, changed, &before, &self.doc, spec.id, given, failed.map_or(Ok(()), Err));
         }
         result
+    }
+
+    /// Store the definitions a command left in the design (`Document::define_inline`): its
+    /// result names them, `defined` the first (as `sketch.dimension` does) and `definitions` all.
+    fn define_inline(&mut self, id: &str, mut v: Value) -> Result<Value> {
+        let mut doc = (*self.doc).clone();
+        let defined = doc.define_inline().map_err(|e| EngineError::BadParams { cmd: id.to_string(), msg: e.to_string() })?;
+        let Some(first) = defined.first() else { return Ok(v) };
+        if let Some(out) = v.as_object_mut() {
+            out.insert("defined".into(), serde_json::json!(first.name));
+            out.insert("definitions".into(), serde_json::json!(defined));
+        }
+        self.doc = Arc::new(doc);
+        Ok(v)
     }
 
     /// A sketch command's result gets `created`: the ids of the points, curves, constraints and
@@ -1462,6 +1503,8 @@ impl Session {
                 || id.starts_with("select.");
             steps.push(ComputedCommand { id: id.clone(), params: params.clone(), before, after: computed.doc.clone(), changed, reply });
         }
+        // What the source was primed with stays out of the session that is adopted (#6901).
+        computed.unprime();
         Ok(ComputedCommands { source: self, computed, steps })
     }
 

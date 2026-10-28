@@ -15,7 +15,9 @@ macro_rules! text_style_doc {
 use super::sketch::{add_c, circumcircle, edit, ids_of, mark_construction, req_parg, result, slot};
 use super::{CommandSpec, in_sketch};
 use crate::params::{bad, num, req_vec2, str_, string_list};
-use crate::{Result, Session};
+use crate::schema::sketch_create::{SplineReverseParams, SplineReverseResult};
+use crate::schema::{TypedContract, output_schema_for};
+use crate::{EngineError, Result, Session};
 
 #[cfg(test)]
 #[path = "sketch_text_move_tests.rs"]
@@ -24,6 +26,8 @@ mod text_move_tests;
 #[cfg(test)]
 #[path = "sketch_text_expr_tests.rs"]
 mod text_expr_tests;
+
+const SPLINE_REVERSE_CONTRACT: TypedContract<SplineReverseParams> = TypedContract::new();
 
 pub static COMMANDS: &[CommandSpec] = &[
     CommandSpec::new("sketch.line.midpoint", "Midpoint Line", midpoint_line)
@@ -83,6 +87,12 @@ pub static COMMANDS: &[CommandSpec] = &[
         .icon("spline")
         .enabled(in_sketch)
         .params("curve: fit point spline id, at: [x,y]: a fit point is inserted where the curve passes nearest to it, between its neighbours (the curve still runs through it and all its old points; constraints on them stay); end?: start|end: `at` becomes the spline's new first or last point instead, and the curve runs on to it (refused when that end is joined to other geometry). Control point splines take no new points yet. Returns point: the new point's id"),
+    CommandSpec::new("sketch.spline.reverse", "Reverse Spline Direction", crate::checked!("sketch.spline.reverse", spline_reverse))
+        .icon("spline")
+        .enabled(in_sketch)
+        .contract(&SPLINE_REVERSE_CONTRACT)
+        .output(output_schema_for::<SplineReverseResult>)
+        .params("curve: spline id (fit point, control point or closed): its last point becomes its first and the curve runs the other way along the same path; its points and the constraints on them stay. Refused for a projected spline and for one an offset uses or makes. Returns curve"),
     CommandSpec::new("sketch.conic", "Conic Curve", conic)
         .at("SKETCH", "CREATE")
         .icon("conic")
@@ -548,7 +558,7 @@ fn blend(s: &mut Session, p: &Value) -> Result<Value> {
 
 fn centerline(s: &mut Session, p: &Value) -> Result<Value> {
     let cmd = "sketch.centerline";
-    let ids = string_list(p, "curves");
+    let ids = string_list(cmd, p, "curves")?;
     if ids.is_empty() {
         return Err(bad(cmd, "`curves` must list lines"));
     }
@@ -573,7 +583,7 @@ fn centerline(s: &mut Session, p: &Value) -> Result<Value> {
 
 fn infinite_line(s: &mut Session, p: &Value) -> Result<Value> {
     let cmd = "sketch.infinite";
-    let ids = string_list(p, "curves");
+    let ids = string_list(cmd, p, "curves")?;
     if ids.is_empty() {
         return Err(bad(cmd, "`curves` must list lines"));
     }
@@ -702,6 +712,17 @@ fn spline_insert_point(s: &mut Session, p: &Value) -> Result<Value> {
         sk.points.get(new).map(|q| q.id.clone()).ok_or_else(|| bad(cmd, "the new point is missing"))
     })?;
     Ok(json!({"point": point, "curve": p.get("curve"), "sketch": info}))
+}
+
+fn spline_reverse(s: &mut Session, p: &Value) -> Result<Value> {
+    let cmd = "sketch.spline.reverse";
+    let id = str_(p, "curve").ok_or_else(|| bad(cmd, "`curve` must be a spline id"))?.to_string();
+    let ((), info) = edit(s, p, cmd, false, |sk, _| {
+        let c = sk.curve_index(&id).ok_or_else(|| bad(cmd, format!("unknown curve `{id}`")))?;
+        sk.reverse_spline(c).map_err(|e| bad(cmd, e.to_string()))
+    })?;
+    let reply = SplineReverseResult { curve: id, sketch: info, param_warnings: Vec::new() };
+    serde_json::to_value(reply).map_err(|e| EngineError::Other(e.to_string()))
 }
 
 fn conic(s: &mut Session, p: &Value) -> Result<Value> {
@@ -893,7 +914,7 @@ fn tangent_centre(sk: &Sketch, a: usize, b: usize, r: f64, near: Vec2) -> Option
 }
 
 fn tangent_curves(sk: &Sketch, p: &Value, cmd: &str, n: usize) -> Result<Vec<usize>> {
-    let ids = string_list(p, "curves");
+    let ids = string_list(cmd, p, "curves")?;
     if ids.len() != n {
         return Err(bad(cmd, format!("`curves` must list {n} curves")));
     }
@@ -990,11 +1011,12 @@ fn arc_slot(s: &mut Session, p: &Value, cmd: &str, o: Vec2, r: f64, t0: f64, swe
             c.construction = true;
             centre_arc = Some(c.id.clone());
         }
+        // Each cap is tangent to both concentric sides, so its radius is half the gap between
+        // them: the two caps are equal without an Equal, which would only be redundant (#8355).
         let mut cons = Vec::new();
         for (a, b) in [(outer, cap_e), (inner, cap_e), (outer, cap_s), (inner, cap_s)] {
             cons.push(add_c(sk, ConstraintKind::Tangent { a, b })?);
         }
-        cons.push(add_c(sk, ConstraintKind::Equal { a: cap_s, b: cap_e })?);
         Ok((ids_of(sk, &[outer, cap_e, inner, cap_s]), cons))
     })?;
     let mut out = result(out, info);

@@ -821,6 +821,7 @@ fn occurrence_items(app: &SolveApp, path: &[u64]) -> Vec<Item> {
                 item.params = Some(json!({"component": placement.component, "occurrence": placement.occurrence, "path": path}));
                 item.enabled = app.session.active_occurrence_path.as_deref() != Some(path);
             }
+            "ui.editInPlace" => item.params = Some(json!({"component": placement.component, "path": path})),
             "occurrence.ground" => {
                 item.label = if placement.grounded { "Unground" } else { "Ground" }.into();
                 item.params = Some(json!({"occurrence": placement.occurrence, "grounded": !placement.grounded}));
@@ -895,6 +896,7 @@ fn component_items(app: &SolveApp, id: u64) -> Vec<Item> {
         let oid = occ.map(|o| o.id).unwrap_or(0);
         v.push(act("ui.activate", "Activate", "component").with(json!({ "component": id })).on(!active));
         if doc.links.contains_key(&id) {
+            v.push(act("ui.editInPlace", "Edit in Place", "edit").with(json!({ "component": id })));
             v.push(act("ui.openLinkedDesign", "Open Linked Design", "open").with(json!({ "component": id })));
         }
         v.push(cmd(app, "occurrence.ground", if grounded { "Unground" } else { "Ground" }).with(json!({ "occurrence": oid, "grounded": !grounded })));
@@ -1117,6 +1119,16 @@ fn sketch_entity_items(app: &SolveApp) -> Vec<Item> {
         && let Some(at) = menu_sketch_point(app, &ss.plane)
     {
         v.push(cmd(app, "sketch.spline.insert_point", "Add Spline Point").with(json!({"curve": curve, "at": [at.x, at.y]})));
+    }
+    // #8224: any spline of the sketch's own runs the other way.
+    if let [curve] = curves.as_slice()
+        && ss
+            .sketch
+            .curve_index(curve)
+            .and_then(|i| ss.sketch.curves.get(i))
+            .is_some_and(|c| matches!(c.kind, CurveKind::Spline { .. }) && c.link.is_none())
+    {
+        v.push(cmd(app, "sketch.spline.reverse", "Reverse Spline Direction").with(json!({ "curve": curve })));
     }
     v.push(act("ui.fix", "Fix/Unfix", "c_fix").with(json!({ "entities": ents })));
     // The clipboard beside Delete, as in every menu.
@@ -1432,6 +1444,12 @@ pub fn run_item(app: &mut SolveApp, item: &Item, at: Pos2) {
                 let _ = app.run("component.activate", p);
             }
         }
+        "ui.editInPlace" => {
+            if let Some(component) = id_of(&p, "component") {
+                let path = p["path"].as_array().map(|path| path.iter().filter_map(Value::as_u64).collect());
+                crate::edit_in_place::open(app, component, path);
+            }
+        }
         "ui.openLinkedDesign" => {
             let Some(component) = id_of(&p, "component") else { return };
             let links = match app.session.execute("component.links", &json!({})) {
@@ -1622,6 +1640,22 @@ pub fn run_item(app: &mut SolveApp, item: &Item, at: Pos2) {
 /// Delete what is selected: sketch entities, features, and bodies (a Remove feature).
 pub fn delete(app: &mut SolveApp) {
     crate::delete::delete_selection(app);
+}
+
+/// A shortcut key pressed while a menu is open: the row of that menu showing `key` runs on the
+/// menu's target, as a click on it would, and the menu closes. A folder, the Origin folder or an
+/// origin plane is not selected by the right-click that opens its menu, so the key's own action
+/// (V on the selection) would miss it. Returns whether the open menu has a row for the key; a
+/// disabled row takes the key and does nothing, as a click on it does.
+pub fn press_shortcut(app: &mut SolveApp, key: &str) -> bool {
+    let Some(at) = app.viewport.context_menu else { return false };
+    let target = app.menu.target.clone();
+    let Some(item) = items(app, &target).into_iter().find(|i| i.shortcut == key && i.children.is_empty()) else { return false };
+    if item.enabled {
+        close(app);
+        run_item(app, &item, at);
+    }
+    true
 }
 
 /// Show/Hide (the V key): what is selected in the viewport or picked in the browser flips its
@@ -2485,7 +2519,8 @@ mod tests {
     }
 
     /// #6533: a right-click on a fit point spline offers Add Spline Point at the clicked spot, and
-    /// the item puts a fit point there. A control point spline is not offered it.
+    /// the item puts a fit point there. A control point spline is not offered it. Every spline is
+    /// offered Reverse Spline Direction (#8224), which runs it the other way.
     #[test]
     fn spline_context_menu_adds_a_fit_point_where_it_was_clicked() {
         let mut h = crate::scenario::Harness::new();
@@ -2518,6 +2553,18 @@ mod tests {
         h.step(&json!({"click":{"world":[c.x,c.y,0]},"button":"right"})).unwrap();
         assert_eq!(h.app.session.selection, vec![Sel::SketchCurve { id: control.clone(), sketch: None }]);
         assert!(items(&h.app, &Target::Viewport).iter().all(|item| item.id != "sketch.spline.insert_point"));
+        let menu = items(&h.app, &Target::Viewport);
+        let item = menu.iter().find(|item| item.id == "sketch.spline.reverse").expect("a control point spline offers Reverse Spline Direction");
+        assert_eq!((item.label.as_str(), item.params.clone()), ("Reverse Spline Direction", Some(json!({"curve": control}))));
+        let points = |h: &crate::scenario::Harness, id: &str| {
+            let state = h.app.session.world_state();
+            let sk = &state.sketch(sid).unwrap().sketch;
+            sk.curves[sk.curve_index(id).unwrap()].kind.point_ids()
+        };
+        let mut reversed = points(&h, &control);
+        reversed.reverse();
+        h.step(&json!({"click":{"handle":"menu:sketch.spline.reverse"}})).unwrap();
+        assert_eq!(points(&h, &control), reversed);
         close(&mut h.app);
 
         let at = spot(&h, &fit, 1);

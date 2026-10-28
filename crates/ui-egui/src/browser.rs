@@ -135,6 +135,8 @@ pub struct TreeState {
     /// The bodies a row at the top of the history lights this frame (`history_rows`), for the
     /// browser, drawn after it, to keep.
     history_hover: Vec<String>,
+    /// The plane a row at the top of the history lights this frame, kept the same way (#6975).
+    history_plane: Option<String>,
     /// A Section Analysis hidden with its eye in the Analysis folder: its plane (origin,
     /// normal), so the eye can bring it back (#822).
     pub hidden_section: Option<(solidcraft_engine::geom::Vec3, solidcraft_engine::geom::Vec3)>,
@@ -610,6 +612,8 @@ struct Actions {
     menu: Option<(Pos2, Target)>,
     hover_bodies: Vec<String>,
     hovered: bool,
+    /// The plane whose row is under the pointer, lit in the view (#6975).
+    hover_plane: Option<String>,
     drop: Option<DropAction>,
     /// What the selection and the 3D view's pointer light in the tree.
     lit: Lit,
@@ -898,6 +902,7 @@ fn render_card(app: &mut SolveApp, ui: &mut egui::Ui, acts: &mut Actions) {
             bounds: crate::ui_kit::Panel::stack_first_bounds(bounds),
             fill_height: true,
             compact: crate::render_ui::compact(app, bounds.width()),
+            editor: false,
             enabled: true,
             header_actions: None,
         },
@@ -1009,6 +1014,7 @@ fn browser_contents(app: &mut SolveApp, ui: &mut egui::Ui, acts: &mut Actions, c
         t.secondary_hline(ui.painter(), ui.max_rect().x_range(), ui.cursor().top() + 1.0, t.toolbar.lerp_to_gamma(t.border, 0.5));
         ui.add_space(t.space_3);
     }
+    crate::edit_in_place::browser_strip(app, ui);
     if collapsible && !stacked {
         browser_rows_hugging(app, ui, acts);
     } else {
@@ -1181,7 +1187,7 @@ pub(crate) fn history_rows(app: &mut SolveApp, ui: &mut egui::Ui) {
     ui.scope(|ui| {
         ui.spacing_mut().item_spacing.y = 0.0;
         folder_rows_at(app, ui, component, path.as_deref(), "bodies", 0, &mut acts, &bodies);
-        origin_rows(app, ui, 0, &acts);
+        origin_rows(app, ui, 0, &mut acts);
     });
     app.tree.reveal = reveal;
     // The browser's own rows reuse these order slots (`TreeState::remember`).
@@ -1189,6 +1195,8 @@ pub(crate) fn history_rows(app: &mut SolveApp, ui: &mut egui::Ui) {
     DRAWN.with(|d| d.borrow_mut().truncate(drawn));
     app.viewport.hover_bodies = acts.hover_bodies.clone();
     app.tree.history_hover = acts.hover_bodies;
+    app.viewport.hover_plane = acts.hover_plane.clone();
+    app.tree.history_plane = acts.hover_plane;
     if let Some(d) = acts.drop {
         apply_drop(app, d);
     }
@@ -1205,6 +1213,8 @@ fn finish_browser(app: &mut SolveApp, ui: &mut egui::Ui, mut acts: Actions) {
     // The history's rows, drawn before the browser, light bodies too (`history_rows`).
     let history = std::mem::take(&mut app.tree.history_hover);
     app.viewport.hover_bodies = if acts.hover_bodies.is_empty() { history } else { acts.hover_bodies };
+    let history_plane = app.tree.history_plane.take();
+    app.viewport.hover_plane = acts.hover_plane.or(history_plane);
     if let Some(d) = acts.drop {
         apply_drop(app, d);
     }
@@ -1323,7 +1333,7 @@ fn component_rows_inner(
         if app.session.doc.parts.contains_key(&id) {
             crate::dialogs_part_size::open(app, id);
         } else {
-            let _ = app.run("component.activate", json!({ "component": id }));
+            crate::edit_in_place::double_click_component(app, json!({ "component": id }));
         }
     }
     if r.hovered {
@@ -1469,8 +1479,11 @@ fn occurrence_rows_inner(
     if r.eye {
         let _ = app.run("browser.visibility", json!({"visible": app.session.occurrence_hidden(path), "paths": [path]}));
     }
-    if r.radio || (r.double && !app.session.doc.parts.contains_key(&placement.component)) {
-        let _ = app.run("component.activate", json!({"component": placement.component, "occurrence": placement.occurrence, "path": path}));
+    let params = json!({"component": placement.component, "occurrence": placement.occurrence, "path": path});
+    if r.radio {
+        let _ = app.run("component.activate", params);
+    } else if r.double && !app.session.doc.parts.contains_key(&placement.component) {
+        crate::edit_in_place::double_click_component(app, params);
     }
     if r.double && app.session.doc.parts.contains_key(&placement.component) {
         crate::dialogs_part_size::open(app, placement.component);
@@ -1584,7 +1597,7 @@ fn origin_things() -> [(&'static str, &'static str, Option<Thing>); 7] {
     ]
 }
 
-fn origin_rows(app: &mut SolveApp, ui: &mut egui::Ui, depth: usize, acts: &Actions) {
+fn origin_rows(app: &mut SolveApp, ui: &mut egui::Ui, depth: usize, acts: &mut Actions) {
     let key = "origin";
     let open = is_open(app, key, false);
     let lit = |thing: &Option<Thing>| thing.as_ref().map_or((false, false), |t| acts.lit.thing(t));
@@ -1650,6 +1663,9 @@ fn origin_rows(app: &mut SolveApp, ui: &mut egui::Ui, depth: usize, acts: &Actio
             && icon == "plane"
         {
             crate::context_menu::open_for(app, p, Target::OriginPlane { name: k.into() });
+        }
+        if r.hovered && icon == "plane" {
+            acts.hover_plane = Some(k.into());
         }
         if r.clicked
             && let Some(x) = sel
@@ -1996,6 +2012,8 @@ struct Entry {
     visible: bool,
     selected: bool,
     color: Option<Color32>,
+    /// A sketch's solve state: its icon's colour and its tooltip (#7245).
+    sketch_state: Option<crate::sketch_state::SketchState>,
     locked: bool,
     sel: Option<Sel>,
     target: Option<Target>,
@@ -2016,6 +2034,7 @@ impl Entry {
             visible: !app.session.visibility.hidden_bodies.contains(&world),
             selected: app.session.selection.iter().any(|s| matches!(s, Sel::Body { name } if name == &world)),
             color: None,
+            sketch_state: None,
             locked: app.session.visibility.locked_bodies.contains(&world),
             sel: Some(Sel::Body { name: world.clone() }),
             target: Some(Target::Body { name: world.clone() }),
@@ -2026,6 +2045,7 @@ impl Entry {
     fn sketch(app: &SolveApp, f: &solidcraft_engine::doc::Feature) -> Self {
         let t = Tokens::get();
         let active = app.session.active_sketch == Some(f.id);
+        let sketch_state = app.session.model.state().sketch(f.id).map(crate::sketch_state::SketchState::of);
         let lost = app.session.model.result(f.id).is_some_and(|result| result.error.is_some())
             && matches!(app.session.doc.sketch_face_attachment(f.id, &app.session.model), solidcraft_engine::doc::FaceAttachmentStatus::Lost { .. });
         Self {
@@ -2044,6 +2064,7 @@ impl Entry {
             visible: sketch_visible(app, f.id),
             selected: active || app.session.selection.iter().any(|s| matches!(s, Sel::Feature { id } if *id == f.id)),
             color: if lost { Some(t.error) } else { active.then_some(t.sketch_accent) },
+            sketch_state,
             locked: false,
             sel: Some(Sel::Feature { id: f.id }),
             target: Some(Target::Sketch { id: f.id }),
@@ -2068,6 +2089,7 @@ impl Entry {
             visible: !app.session.visibility.hidden_origin.contains(&f.name),
             selected: app.session.selection.contains(&sel),
             color: None,
+            sketch_state: None,
             locked: false,
             sel: Some(sel),
             target: Some(Target::Plane { id: f.id }),
@@ -2441,6 +2463,9 @@ fn entry_row(
         _ => e.locked,
     };
     let badges: &[&str] = if locked { &["lock"] } else { &[] };
+    // Cached with the evaluated model; the preference is read as the row is drawn.
+    let sketch_state = e.sketch_state.filter(|_| app.preferences.sketch_state_icons);
+    let state_tip = sketch_state.map(crate::sketch_state::SketchState::text);
     let r = draw_row(
         ui,
         ui.id().with(("item", &e.row_key)),
@@ -2458,6 +2483,8 @@ fn entry_row(
             swatch: appearance.swatch,
             secondary: &appearance.name,
             count: &appearance.count,
+            icon_ink: sketch_state.and_then(|state| state.ink(&Tokens::get())),
+            tip: state_tip.as_deref(),
             badges,
             mark,
             ..Default::default()
@@ -2515,6 +2542,11 @@ fn entry_row(
     }
     if r.hovered && !e.bodies.is_empty() {
         acts.hover(e.bodies.iter());
+    }
+    if r.hovered
+        && let Thing::Plane(name) = &e.thing
+    {
+        acts.hover_plane = Some(name.clone());
     }
     if let Some(p) = r.secondary
         && let Some(t) = e.target.clone()

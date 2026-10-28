@@ -5,7 +5,7 @@ use crate::ui_kit::{Container, Surface};
 use egui::{Align2, Color32, FontId, Pos2, Rect, Sense, Shape, Stroke, pos2, vec2};
 use serde_json::json;
 use solidcraft_engine::Sel;
-use solidcraft_engine::geom::{Vec2, Vec3};
+use solidcraft_engine::geom::{Plane, Vec2, Vec3};
 use solidcraft_engine::render::{Camera, Mat4, Rgb};
 use solidcraft_engine::sketch::CurveKind;
 use solidcraft_engine::view::{GridFade, GridPlane, colors, grid_ext, grid_plane, grid_step, sketch_lines_with_sampler};
@@ -155,6 +155,8 @@ pub struct ViewportState {
     /// (sketch, point id): it is drawn, and it takes the pointer from further away
     /// ([`WOKEN_CENTRE_PX`]), until another curve or point is hovered.
     pub woken_centre: Option<(u64, String)>,
+    /// The centre or midpoint most recently hovered for visual H/V tracking.
+    pub(crate) tracking: crate::inference::Tracking,
     pub mouse: Option<Pos2>,
     /// Box selection being dragged.
     pub boxsel: Option<BoxSel>,
@@ -162,6 +164,9 @@ pub struct ViewportState {
     pub hover_feature: Option<u64>,
     /// Bodies whose browser row is under the cursor: highlighted the same way.
     pub hover_bodies: Vec<String>,
+    /// The origin or construction plane whose browser row is under the cursor: lit as if the
+    /// pointer were on it in the view.
+    pub hover_plane: Option<String>,
     /// The model point an orbit turns around (Preferences: orbit around the cursor).
     pub orbit_pivot: Option<Vec3>,
     /// The orbit drag under way, summed from where it began (see [`crate::navigation::orbit`]).
@@ -390,7 +395,8 @@ pub fn view_bounds(app: &SolveApp) -> solidcraft_engine::geom::Aabb3 {
     if crate::open_meshing::framing(app) {
         return solidcraft_engine::view::unmeshed_bounds(&app.session);
     }
-    solidcraft_engine::view::bounds(&app.session)
+    let own = solidcraft_engine::view::bounds(&app.session);
+    crate::edit_in_place::bounds(app).map_or(own, |context| if own.is_empty() { context } else { own.union(&context) })
 }
 
 /// The middle of the shown bodies the view shows part of: what a cursor orbit begun over empty
@@ -464,6 +470,7 @@ fn scene_key(app: &SolveApp) -> u64 {
     // Two themes may share a light/dark base while drawing different geometry colours.
     crate::theme_files::color_key(&Tokens::get()).hash(&mut h);
     app.session.active_sketch.hash(&mut h);
+    crate::edit_in_place::scene_key(app).hash(&mut h);
     // A reset palette arena (another design) invalidates every cached block's indices.
     app.viewport.palette.lock().map_or(0, |a| a.generation()).hash(&mut h);
     // Continuity seams are model-scene lines but are not part of the document or world state.
@@ -487,6 +494,8 @@ fn sketch_scene_key(app: &SolveApp, proj: &Proj) -> u64 {
     // Finished sketches are drawn over the bodies when the preference says so.
     app.preferences.reference_geometry_through_bodies.hash(&mut h);
     app.preferences.sketch_halo.hash(&mut h);
+    // The grid previews the plane Create Sketch would take (#6975).
+    previewed_sketch_plane(app).map(|p| [p.origin, p.x, p.y].map(|v| [v.x, v.y, v.z].map(f64::to_bits))).hash(&mut h);
     (std::sync::Arc::as_ptr(&crate::open_meshing::shown_world(app)) as usize).hash(&mut h);
     crate::sketch_display::projection_key(proj, app.viewport.pixels_per_point()).hash(&mut h);
     h.finish()
@@ -1463,6 +1472,7 @@ pub(crate) fn build_scene(app: &SolveApp) -> GpuScene {
             }
         }
     }
+    crate::edit_in_place::draw_context(app, &mut sc);
 
     sc
 }
@@ -1488,12 +1498,13 @@ fn build_sketch_scene(app: &SolveApp, proj: &Proj) -> GpuScene {
     let s = &app.session;
     let st = crate::open_meshing::shown_world(app);
     let mut fill_budget = 131_072;
-    let sketch_plane = solidcraft_engine::view::open_sketch_plane(s);
+    let sketch_plane = solidcraft_engine::view::open_sketch_plane(s).or_else(|| previewed_sketch_plane(app));
     if sketch_plane.is_some() || (app.ui.show_grid && !active_view(app).hide_grid) {
         let (minor, major) = grid_step(app.cam.half_height());
-        // An open sketch always has its grid on its own plane; otherwise the ground plane: XY with
-        // Z up, XZ with Y up (laid out in the camera's Z-up frame), or the upright origin plane
-        // facing the view when the ground is seen edge-on.
+        // An open sketch always has its grid on its own plane, and so does the plane Create
+        // Sketch would take; otherwise the ground plane: XY with Z up, XZ with Y up (laid out in
+        // the camera's Z-up frame), or the upright origin plane facing the view when the ground
+        // is seen edge-on.
         let (c, u, v, slant, ext, far_reach, w3): (Vec3, Vec3, Vec3, f64, f64, f64, Box<dyn Fn(Vec3) -> [f32; 3]>) = if let Some(pl) = &sketch_plane {
             let (c, u, v) = solidcraft_engine::view::sketch_grid_frame(pl, app.cam.target, major);
             // How steeply the sketch's plane is seen: the grid reaches as far on it as the view
@@ -1713,7 +1724,7 @@ pub(crate) fn dashes(pts: &[Vec3], pattern: &[f64]) -> Vec<(Vec3, Vec3)> {
 }
 
 /// Colour as straight (unpremultiplied) sRGBA bytes for the GPU.
-fn c4(c: Color32) -> [u8; 4] {
+pub(crate) fn c4(c: Color32) -> [u8; 4] {
     c.to_srgba_unmultiplied()
 }
 
@@ -1729,6 +1740,24 @@ pub fn origin_planes(app: &SolveApp) -> Vec<(&'static str, Vec3, [Vec3; 4])> {
         .into_iter()
         .filter(|(n, _, _)| creating || !app.session.visibility.hidden_origin.iter().any(|h| h == n))
         .collect()
+}
+
+/// The plane Create Sketch would put the sketch on, while it waits for one (#6975): the origin
+/// or construction plane under the pointer, in the view or in the browser. The grid is drawn on
+/// it, so the sketch's plane shows before the click.
+pub fn previewed_sketch_plane(app: &SolveApp) -> Option<Plane> {
+    if app.session.active_sketch.is_some() || !app.picking_sketch_plane() {
+        return None;
+    }
+    let name = match (&app.viewport.hover_plane, &app.viewport.hover) {
+        (Some(name), _) | (None, Some(Hit::Plane { name, .. })) => name,
+        _ => return None,
+    };
+    solidcraft_engine::view::construction_planes(&app.session)
+        .into_iter()
+        .find(|(_, n, _)| n == name)
+        .map(|(_, _, p)| p)
+        .or_else(|| origin_planes(app).into_iter().find(|(n, _, _)| *n == name.as_str()).and_then(|(n, _, _)| Plane::named(n)))
 }
 
 /// A point on origin plane `name`'s square that a click at its screen point picks: the middle,
@@ -3075,6 +3104,7 @@ fn highlight_geometry_key(app: &SolveApp) -> u64 {
     hover_drawn(&app.viewport.hover).hash(&mut h);
     app.viewport.hover_feature.hash(&mut h);
     app.viewport.hover_bodies.hash(&mut h);
+    app.viewport.hover_plane.hash(&mut h);
     // Which mesh lights a face follows how the model draws its body (see `shown_mesh`), and at
     // which display quality its plan and edges are made.
     solidcraft_engine::doc::display_quality::current().hash(&mut h);
@@ -3346,7 +3376,7 @@ pub(crate) fn build_highlight(app: &SolveApp) -> GpuScene {
         // Origin planes and construction planes.
         let plane_state = |name: &str| {
             let selected = sel.iter().any(|x| matches!(x, Sel::Plane { name: n } if n == name));
-            let hovered = matches!(hover, Some(Hit::Plane { name: n, .. }) if n == name);
+            let hovered = matches!(hover, Some(Hit::Plane { name: n, .. }) if n == name) || app.viewport.hover_plane.as_deref() == Some(name);
             (selected, hovered)
         };
         let mut planes: Vec<(String, [Vec3; 4], Color32)> =
@@ -3903,9 +3933,12 @@ pub fn show(app: &mut SolveApp, ui: &mut egui::Ui) {
     app.viewport.hover = cand.as_ref().map(|c| c.0.clone());
     wake_centre(app, &hits);
     // Select Other: a press held still opens the list of everything under it; while the list is
-    // open its row under the pointer is what lights up.
-    let held =
-        crate::select_other::track_hold(app, ui.ctx(), &proj, inside, primary_pressed, primary_down, hover, primary_nav.is_some() || mode.is_some());
+    // open its row under the pointer is what lights up. A mode lit in the navigation bar or a
+    // held Space owns drags, not a still press, so only a navigation that has started cancels
+    // it. A preset's modifier binding (Maya Alt, Alias Shift+Alt) or Ctrl+left orbit is a
+    // gesture to navigate from the press on, so it still cancels the hold at once.
+    let navigating_from_press = mode.is_some() || app.viewport.primary_nav.is_some();
+    let held = crate::select_other::track_hold(app, ui.ctx(), &proj, inside, primary_pressed, primary_down, hover, navigating_from_press);
     crate::select_other::hover_override(app);
     let painter = ui.painter_at(rect);
     // Background gradient.
@@ -4225,6 +4258,18 @@ pub fn show(app: &mut SolveApp, ui: &mut egui::Ui) {
                 .collect();
             let _ = app.run("select.set", json!({ "items": items, "add": add }));
         }
+        // Double-click a component's face: edit a linked one in place, activate any other.
+        if resp.double_clicked()
+            && !held
+            && !dim_edit
+            && mods.is_none()
+            && app.tool.is_none()
+            && app.dialog.is_none()
+            && app.session.active_sketch.is_none()
+            && let Some(Hit::Face { body, .. }) = app.viewport.hover.clone()
+        {
+            crate::edit_in_place::double_click_face(app, &body);
+        }
         // A right-click, unless the same press opened the mouse gestures' ring. egui's click
         // already allows the pointer a few points of travel, as a mouse moves while it is clicked.
         if resp.secondary_clicked() && !crate::mouse_gesture::took_press(app) {
@@ -4485,6 +4530,8 @@ pub fn show(app: &mut SolveApp, ui: &mut egui::Ui) {
     crate::dim_view::show(app, ui, &painter, &proj);
     crate::sketch_text_handles::show(app, ui, &painter, &proj, hover);
     crate::sketch3d::show(app, &painter, &proj);
+    let tracking_cursor = hover.filter(|_| inside && !navigating && !app.esc_handled && !ui.input(|i| i.key_pressed(egui::Key::Escape)));
+    crate::inference::track_and_show(app, &painter, &proj, tracking_cursor);
     crate::inference::show(app, &painter, &proj);
     crate::drag_snap::show(app, &painter, &proj);
     crate::insert_handles::show(app, ui, &proj);
@@ -4617,8 +4664,8 @@ fn agent_chip(app: &mut SolveApp, ui: &egui::Ui, view: Rect, taken: &[Rect]) -> 
 /// How long a status message stays in the view (milliseconds).
 const STATUS_TOAST_MS: f64 = 6000.0;
 
-/// A single visual pattern for ongoing work, the existing six-second status and the 3D mouse
-/// calibration offer, stacked from the bottom of the free view. Returns the toasts' rects.
+/// A single visual pattern for ongoing work, the existing six-second status, the 3D mouse
+/// calibration offer and the stand-up note, stacked from the bottom of the free view. Returns the toasts' rects.
 fn transient_messages(app: &mut SolveApp, ui: &egui::Ui, viewport: Rect) -> Vec<Rect> {
     // Nothing to show or time: an idle window skips the layout. The offer is checked too, as its clock
     // runs from the frames `due` sees.
@@ -4626,6 +4673,7 @@ fn transient_messages(app: &mut SolveApp, ui: &egui::Ui, viewport: Rect) -> Vec<
         && app.computing_since().is_none()
         && app.agent_computing().is_none()
         && crate::space_mouse_offer::offerable(app).is_none()
+        && !crate::stand_up::note_pending(app)
     {
         return Vec::new();
     }
@@ -4637,11 +4685,32 @@ fn transient_messages(app: &mut SolveApp, ui: &egui::Ui, viewport: Rect) -> Vec<
     }
     let view = crate::shell::content_rect(app, viewport);
     let mut free = crate::viewport_layout::free_rect(view, &obstacles).shrink(t.space_8);
+    // The note offering to stand up a file just opened from a program not known to save Y up
+    // (#7717): the shared toast with its buttons, which go by themselves and never block input.
+    if let Some(text) = crate::stand_up::note_due(app, ui.ctx()) {
+        let labels = crate::stand_up::note_labels();
+        let actions =
+            [(labels[0].as_str(), ToastKind::Primary), (labels[1].as_str(), ToastKind::Secondary), (labels[2].as_str(), ToastKind::Dismiss)];
+        if let Some((r, clicked, buttons)) = paint_toast_with(ui, free, text, ToastLead::Dot(false), &actions) {
+            crate::scenario::publish_rect("toast:stand_up", r);
+            for (handle, button) in crate::stand_up::NOTE_HANDLES.iter().zip(&buttons) {
+                crate::scenario::publish_handle(handle, button.center());
+            }
+            obstacles.push(r);
+            free.max.y = r.top() - t.space_8;
+            shown.push(r);
+            crate::stand_up::note_keep(app, ui.ctx(), r);
+            if let Some(index) = clicked {
+                crate::stand_up::note_act(app, index);
+            }
+        }
+        ui.ctx().request_repaint_after(std::time::Duration::from_millis(500));
+    }
     // The 3D mouse calibration offer: text and actions from its module, drawn by the shared toast.
     if let Some(offer) = crate::space_mouse_offer::due(app, ui.ctx()) {
         let labels: Vec<String> = offer.actions.iter().map(|action| crate::i18n::tr(action.label()).to_string()).collect();
         let labels: Vec<(&str, ToastKind)> = labels.iter().map(String::as_str).zip(offer.actions.iter().map(|action| action.kind())).collect();
-        if let Some((r, clicked)) = paint_toast_with(ui, free, crate::i18n::tr("ui.3d_mouse_offer").to_string(), ToastLead::Dot(false), &labels) {
+        if let Some((r, clicked, _)) = paint_toast_with(ui, free, crate::i18n::tr("ui.3d_mouse_offer").to_string(), ToastLead::Dot(false), &labels) {
             crate::scenario::publish_rect("toast:space_mouse_offer", r);
             obstacles.push(r);
             free.max.y = r.top() - t.space_8;
@@ -4750,15 +4819,21 @@ enum ToastLead {
 
 fn paint_toast(ui: &egui::Ui, free: Rect, text: String, error: bool, computing: bool) -> Option<Rect> {
     let lead = if computing { ToastLead::Spinner } else { ToastLead::Dot(error) };
-    paint_toast_with(ui, free, text, lead, &[]).map(|(rect, _)| rect)
+    paint_toast_with(ui, free, text, lead, &[]).map(|(rect, _, _)| rect)
 }
 
 /// The one toast painter: its text in a card at the bottom centre of `free`, led by a dot or a
 /// spinner, and, below the text, a wrapping row of buttons (`actions`, kit buttons). Returns the
-/// card's rect and which button was clicked, if any. With no actions the card is exactly the status
+/// card's rect, which button was clicked, if any, and where each button is (for handles). With no actions the card is exactly the status
 /// and computing toast it always was. The buttons are not live while an issue report holds CAD
 /// input; none is laid outside the card, whose width is bounded by `free`.
-fn paint_toast_with(ui: &egui::Ui, free: Rect, text: String, lead: ToastLead, actions: &[(&str, ToastKind)]) -> Option<(Rect, Option<usize>)> {
+fn paint_toast_with(
+    ui: &egui::Ui,
+    free: Rect,
+    text: String,
+    lead: ToastLead,
+    actions: &[(&str, ToastKind)],
+) -> Option<(Rect, Option<usize>, Vec<Rect>)> {
     if !free.is_finite() || !free.is_positive() || free.width() <= 40.0 {
         return None;
     }
@@ -4800,6 +4875,7 @@ fn paint_toast_with(ui: &egui::Ui, free: Rect, text: String, lead: ToastLead, ac
     let text_top = r.min + vec2(28.0, 8.0);
     painter.galley(text_top, galley.clone(), t.text);
     let mut clicked = None;
+    let mut buttons = Vec::with_capacity(actions.len());
     let origin = text_top + vec2(0.0, galley.size().y + gap);
     for (index, ((label, kind), spot)) in actions.iter().zip(&spots).enumerate() {
         let at = spot.translate(origin.to_vec2());
@@ -4820,8 +4896,9 @@ fn paint_toast_with(ui: &egui::Ui, free: Rect, text: String, lead: ToastLead, ac
         if response.clicked() {
             clicked = Some(index);
         }
+        buttons.push(response.rect);
     }
-    Some((r, clicked))
+    Some((r, clicked, buttons))
 }
 
 /// A click without a command: select the candidate (replacing the selection, or adding /
@@ -5354,8 +5431,8 @@ fn overlays(app: &SolveApp, painter: &egui::Painter, proj: &Proj) {
         }
     }
     loose_end_markers(sk, &ss.ends, &ss.plane, painter, proj, &v);
-    // Sketch status.
-    if let Some(r) = app.viewport.layout.as_ref().map(|l| l.content) {
+    // Sketch status, unless the status bar shows it (#7243).
+    if let Some(r) = app.viewport.layout.as_ref().map(|l| l.content).filter(|_| !crate::status_bar::shown(app)) {
         let status = if !ss.report.ok() {
             crate::i18n::tr("sketch.status_conflict").to_string()
         } else if ss.report.dof == 0 {
@@ -10180,6 +10257,49 @@ mod grid_plane_tests {
         assert_eq!(*app.viewport.grid_plane.lock().unwrap(), GridPlane::Ground, "a clear turn off the ground returns");
     }
 
+    /// #6975: while Create Sketch waits for its plane, the grid lies on the origin plane under
+    /// the pointer, or under the pointer in the browser, so the sketch's plane shows before the
+    /// click. Otherwise it stays on the ground.
+    #[test]
+    fn create_sketch_previews_the_plane_under_the_pointer_on_the_grid() {
+        let rect = Rect::from_min_size(Pos2::ZERO, egui::vec2(800.0, 600.0));
+        let mut app = SolveApp::new(solidcraft_engine::Session::default(), crate::Services::default());
+        app.ui.show_grid = true;
+        app.preferences.grid_follows_view = false;
+        let grid = |app: &SolveApp| -> Vec<[f32; 3]> {
+            build_sketch_scene(app, &projection(app, rect))
+                .under
+                .as_chunks::<32>()
+                .0
+                .iter()
+                .flat_map(|l| [&l[0..12], &l[12..24]])
+                .map(|b| [0, 4, 8].map(|i| f32::from_le_bytes(b[i..i + 4].try_into().unwrap())))
+                .collect()
+        };
+        // Every grid point has coordinate `axis` 0: the grid lies on that origin plane.
+        let on = |app: &SolveApp, axis: usize| {
+            let points = grid(app);
+            !points.is_empty() && points.iter().all(|p| p[axis].abs() < 1e-3)
+        };
+        assert!(on(&app, 2), "the ground grid");
+        app.viewport.hover = Some(Hit::Plane { name: "XZ".into(), point: Vec3::ZERO });
+        assert!(on(&app, 2), "a plane under the pointer outside Create Sketch moves nothing");
+        app.start("sketch.create");
+        assert!(on(&app, 1), "on XZ, under the pointer");
+        let key = sketch_scene_key(&app, &projection(&app, rect));
+        app.viewport.hover = None;
+        app.viewport.hover_plane = Some("YZ".into());
+        assert_ne!(sketch_scene_key(&app, &projection(&app, rect)), key, "the cached grid is drawn again");
+        assert!(on(&app, 0), "on YZ, whose browser row is under the pointer");
+        app.viewport.hover_plane = None;
+        assert!(on(&app, 2), "back on the ground");
+        // With the grid turned off, the preview still shows the plane, as an open sketch's grid does.
+        app.ui.show_grid = false;
+        assert!(grid(&app).is_empty());
+        app.viewport.hover = Some(Hit::Plane { name: "XZ".into(), point: Vec3::ZERO });
+        assert!(on(&app, 1), "the preview grid is drawn even with the grid off");
+    }
+
     /// The grid's centre is where the view's axis meets the ground, but at a grazing slant (a
     /// camera 10 mm above the ground, looking almost along it) no further than the grid's
     /// half-size from the point under the target, so the ground in front of the camera keeps
@@ -10583,6 +10703,48 @@ mod grid_plane_tests {
         let sc = build_highlight(&app);
         assert_eq!(sc.xray.len(), 3 * 6 * crate::gpu::TRI_SIZE, "the preference draws reference planes through bodies");
         assert!(sc.guide_trans.is_empty());
+    }
+
+    /// #6975: while Create Sketch waits for its plane, the plane under the pointer is lit, and a
+    /// plane's browser row under the pointer lights it the same way.
+    #[test]
+    fn create_sketch_lights_the_plane_under_the_pointer_or_its_browser_row() {
+        let mut app = SolveApp::new(solidcraft_engine::Session::default(), crate::Services::default());
+        app.start("sketch.create");
+        let plain = build_highlight(&app).xray;
+        app.viewport.hover = Some(Hit::Plane { name: "XZ".into(), point: Vec3::ZERO });
+        let lit = build_highlight(&app).xray;
+        assert_ne!(lit, plain, "the plane under the pointer is lit");
+        app.viewport.hover = None;
+        let key = highlight_key(&app);
+        app.viewport.hover_plane = Some("XZ".into());
+        assert_ne!(highlight_key(&app), key, "the highlight is built again");
+        assert_eq!(build_highlight(&app).xray, lit, "its browser row lights it the same way");
+    }
+
+    /// #6975: New Sketch shows the origin planes; the plane under the pointer, in the view or as
+    /// its row in the browser, is the one previewed, and a click sketches on it.
+    #[test]
+    fn create_sketch_previews_the_hovered_plane_and_a_click_sketches_on_it() {
+        let mut h = crate::scenario::Harness::new();
+        h.app.tree.expanded.insert("origin".into());
+        h.step(&json!({"start":"sketch.create"})).unwrap();
+        assert_eq!(origin_planes(&h.app).len(), 3, "the origin planes are in the scene while choosing");
+        assert!(previewed_sketch_plane(&h.app).is_none(), "nothing under the pointer yet");
+        // Whether `plane` lies on origin plane `name`.
+        let on = |plane: Option<Plane>, name: &str| {
+            plane.zip(Plane::named(name)).is_some_and(|(a, b)| a.normal().dot(b.normal()).abs() > 0.999 && a.origin.dot(b.normal()).abs() < 1e-9)
+        };
+        h.step(&json!({"move":{"plane":"YZ"}})).unwrap();
+        assert!(on(previewed_sketch_plane(&h.app), "YZ"), "YZ under the pointer in the view");
+        let row = crate::scenario::handle_at("row:XY").expect("the XY row");
+        h.call("ui.move", json!({"x": row.x, "y": row.y}));
+        assert_eq!(h.app.viewport.hover_plane.as_deref(), Some("XY"));
+        assert!(on(previewed_sketch_plane(&h.app), "XY"), "XY under the pointer in the browser");
+        h.step(&json!({"click":{"plane":"XZ"}})).unwrap();
+        let state = h.app.session.world_state();
+        assert!(on(state.sketches.first().map(|s| s.plane), "XZ"), "the click sketches on XZ");
+        assert!(previewed_sketch_plane(&h.app).is_none(), "the open sketch has its own grid");
     }
 
     /// A finished sketch is depth-tested unless the preference draws reference geometry through
