@@ -643,8 +643,7 @@ fn timeline_contents(app: &mut SolveApp, ui: &mut egui::Ui, floating: bool) {
     x += t.space_10 + t.space_8;
     let mut drag_rect = grip;
     let label = p.layout_no_wrap(crate::i18n::tr("ui.history_title").to_string(), crate::fonts::semibold(t.font_heading), t.text);
-    let controls = crate::ui_kit::HistoryTransport::shown(app.preferences.history_play_button);
-    if x + label.size().x + t.space_12 + crate::ui_kit::history_transport_width(controls.len()) <= r.right() {
+    if x + label.size().x + t.space_12 + crate::ui_kit::history_transport_width() <= r.right() {
         let title_rect = Rect::from_min_size(pos2(x, r.center().y - label.size().y / 2.0), label.size());
         p.galley(title_rect.min, label.clone(), t.text);
         drag_rect = drag_rect.union(title_rect);
@@ -653,6 +652,7 @@ fn timeline_contents(app: &mut SolveApp, ui: &mut egui::Ui, floating: bool) {
     let response = ui.interact(drag_rect, egui::Id::new("sc_history_dock_grip"), Sense::drag());
     crate::scenario::publish_handle("history:grip", drag_rect.center());
     crate::timeline_left::dock_drag(app, ui, &response);
+    let controls = crate::ui_kit::HistoryTransport::shown(app.preferences.history_play_button);
     for &control in controls {
         let br = Rect::from_center_size(pos2(x + t.space_24 / 2.0, r.center().y), vec2(t.space_24, t.space_24));
         let response = control.show(ui, br, app.timeline_playback.is_some());

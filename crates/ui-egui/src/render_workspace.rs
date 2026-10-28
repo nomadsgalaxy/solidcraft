@@ -1814,9 +1814,6 @@ pub fn show(app: &mut SolveApp, ui: &mut egui::Ui) {
 }
 
 pub(crate) fn interactive_command_info(app: &SolveApp, command: &solidcraft_engine::CommandSpec) -> solidcraft_engine::CommandInfo {
-    if command.id == "timeline.play" {
-        return crate::timeline::playback_command_info(app, command);
-    }
     ribbon::command_info(app, command)
 }
 pub(crate) fn start_interactive(app: &mut SolveApp, id: &str) -> bool {

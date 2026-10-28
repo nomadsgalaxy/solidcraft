@@ -217,8 +217,13 @@ impl HistoryTransport {
     }
 }
 
-/// The width of `count` transport buttons side by side.
-pub(crate) fn history_transport_width(count: usize) -> f32 {
+pub(crate) fn history_transport_width() -> f32 {
+    let t = Tokens::get();
+    t.space_24 * HistoryTransport::ALL.len() as f32 + t.space_2 * (HistoryTransport::ALL.len() - 1) as f32
+}
+
+/// The width of `count` transport buttons side by side (five with Play History shown).
+pub(crate) fn history_controls_width(count: usize) -> f32 {
     let t = Tokens::get();
     t.space_24 * count as f32 + t.space_2 * count.saturating_sub(1) as f32
 }
@@ -226,7 +231,7 @@ pub(crate) fn history_transport_width(count: usize) -> f32 {
 /// Thin and minimum named widths; wider named panels retain their measured width.
 pub(crate) fn history_width(names: bool) -> f32 {
     let t = Tokens::get();
-    if names { history_transport_width(HistoryTransport::ALL.len()) + t.space_10 * 2.0 + t.space_8 } else { t.control_height * 2.0 }
+    if names { history_transport_width() + t.space_10 * 2.0 + t.space_8 } else { t.control_height * 2.0 }
 }
 
 pub(crate) fn history_clamp_width(width: f32) -> f32 {

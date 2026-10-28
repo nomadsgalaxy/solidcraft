@@ -369,10 +369,10 @@ fn timeline_transport(app: &mut SolveApp, ui: &mut egui::Ui, names: bool) {
         );
         let handle = crate::ui_kit::panel_grip(&mut grip).rect;
         // A named column too narrow for five buttons beside its grip leaves Play to the ribbon.
-        if controls_right - crate::ui_kit::history_transport_width(controls.len()) < handle.right() + t.space_2 {
+        if controls_right - crate::ui_kit::history_controls_width(controls.len()) < handle.right() + t.space_2 {
             controls = &crate::ui_kit::HistoryTransport::ALL;
         }
-        let controls_width = crate::ui_kit::history_transport_width(controls.len());
+        let controls_width = crate::ui_kit::history_controls_width(controls.len());
         let title = crate::i18n::tr("ui.history_title");
         let galley = ui.painter().layout_no_wrap(title.to_owned(), crate::fonts::semibold(t.font_heading), t.text);
         let text_left = handle.right() + t.space_8;
@@ -394,7 +394,7 @@ fn timeline_transport(app: &mut SolveApp, ui: &mut egui::Ui, names: bool) {
         let rect = if names {
             Rect::from_min_size(
                 pos2(
-                    controls_right - crate::ui_kit::history_transport_width(controls.len()) + i as f32 * (side + t.space_2),
+                    controls_right - crate::ui_kit::history_controls_width(controls.len()) + i as f32 * (side + t.space_2),
                     header.center().y - side / 2.0,
                 ),
                 vec2(side, side),

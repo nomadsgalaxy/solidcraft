@@ -1202,9 +1202,9 @@ impl SolveApp {
                 }
                 if matches!(id, "file.new" | "doc.open" | "doc.recover") {
                     documents::reset_chat(self);
-                    timeline::stop_playback(self);
                     render_workspace::reset_document(self);
                     dim_view::cancel();
+                    timeline::stop_playback(self);
                     self.menu.props = None;
                     sketch_attachment_ui::clear(self);
                     // The old document is already replaced: discard its editor without
