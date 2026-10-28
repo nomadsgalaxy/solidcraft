@@ -57,6 +57,7 @@ impl Catalog {
 
 static ENGLISH: Catalog = Catalog::new("en", "English", include_str!(concat!(env!("OUT_DIR"), "/locales/en.json")));
 static ARABIC: Catalog = Catalog::new("ar", "العربية", include_str!(concat!(env!("OUT_DIR"), "/locales/ar.json")));
+static BOSNIAN: Catalog = Catalog::new("bs", "Bosanski", include_str!(concat!(env!("OUT_DIR"), "/locales/bs.json")));
 static CZECH: Catalog = Catalog::new("cs", "Čeština", include_str!(concat!(env!("OUT_DIR"), "/locales/cs.json")));
 static DANISH: Catalog = Catalog::new("da", "Dansk", include_str!(concat!(env!("OUT_DIR"), "/locales/da.json")));
 static GERMAN: Catalog = Catalog::new("de", "Deutsch", include_str!(concat!(env!("OUT_DIR"), "/locales/de.json")));
@@ -66,6 +67,7 @@ static SPANISH: Catalog = Catalog::new("es", "Español (España)", include_str!(
 static FRENCH: Catalog = Catalog::new("fr", "Français", include_str!(concat!(env!("OUT_DIR"), "/locales/fr.json")));
 static GALICIAN: Catalog = Catalog::new("gl", "Galego", include_str!(concat!(env!("OUT_DIR"), "/locales/gl.json")));
 static HEBREW: Catalog = Catalog::new("he", "עברית", include_str!(concat!(env!("OUT_DIR"), "/locales/he.json")));
+static CROATIAN: Catalog = Catalog::new("hr", "Hrvatski", include_str!(concat!(env!("OUT_DIR"), "/locales/hr.json")));
 static HUNGARIAN: Catalog = Catalog::new("hu", "Magyar", include_str!(concat!(env!("OUT_DIR"), "/locales/hu.json")));
 static INDONESIAN: Catalog = Catalog::new("id", "Bahasa Indonesia", include_str!(concat!(env!("OUT_DIR"), "/locales/id.json")));
 static ITALIAN: Catalog = Catalog::new("it", "Italiano", include_str!(concat!(env!("OUT_DIR"), "/locales/it.json")));
@@ -78,6 +80,7 @@ static POLISH: Catalog = Catalog::new("pl", "Polski", include_str!(concat!(env!(
 static PORTUGUESE_BR: Catalog = Catalog::new("pt-BR", "Português (Brasil)", include_str!(concat!(env!("OUT_DIR"), "/locales/pt-BR.json")));
 static ROMANIAN: Catalog = Catalog::new("ro", "Română", include_str!(concat!(env!("OUT_DIR"), "/locales/ro.json")));
 static RUSSIAN: Catalog = Catalog::new("ru", "Русский", include_str!(concat!(env!("OUT_DIR"), "/locales/ru.json")));
+static SERBIAN: Catalog = Catalog::new("sr", "Српски", include_str!(concat!(env!("OUT_DIR"), "/locales/sr.json")));
 static SWEDISH: Catalog = Catalog::new("sv", "Svenska", include_str!(concat!(env!("OUT_DIR"), "/locales/sv.json")));
 static TURKISH: Catalog = Catalog::new("tr", "Türkçe", include_str!(concat!(env!("OUT_DIR"), "/locales/tr.json")));
 static UKRAINIAN: Catalog = Catalog::new("uk", "Українська", include_str!(concat!(env!("OUT_DIR"), "/locales/uk.json")));
@@ -90,6 +93,7 @@ static CHINESE_TRADITIONAL: Catalog = Catalog::new("zh-TW", "繁體中文", incl
 pub const LOCALES: &[&Catalog] = &[
     &ENGLISH,
     &ARABIC,
+    &BOSNIAN,
     &CZECH,
     &DANISH,
     &GERMAN,
@@ -98,6 +102,7 @@ pub const LOCALES: &[&Catalog] = &[
     &FRENCH,
     &GALICIAN,
     &HEBREW,
+    &CROATIAN,
     &HUNGARIAN,
     &INDONESIAN,
     &ITALIAN,
@@ -110,6 +115,7 @@ pub const LOCALES: &[&Catalog] = &[
     &PORTUGUESE_BR,
     &ROMANIAN,
     &RUSSIAN,
+    &SERBIAN,
     &SWEDISH,
     &TURKISH,
     &UKRAINIAN,
@@ -299,6 +305,14 @@ pub fn tr(id: &str) -> &str {
 }
 pub fn tr_label(label: &str) -> &str {
     CURRENT.with(|current| current.get().label(label))
+}
+
+/// Every English catalog entry `(id, text)`, for Preferences search to match a translation
+/// back to the words it was written in.
+pub(crate) fn each_english_message(mut f: impl FnMut(&str, &str)) {
+    for (id, text) in ENGLISH.messages() {
+        f(id, text);
+    }
 }
 pub fn format(id: &str, args: &[(&str, &str)]) -> String {
     CURRENT.with(|current| current.get().format(id, args))
@@ -678,7 +692,6 @@ mod tests {
                 "Strip",
                 "Pick",
                 "Component",
-                "Product picking is not supported yet.",
                 "The live preview shows direct light only and no shadows.",
             ] {
                 assert_ne!(locale.label(label), label, "{language}: {label}");
@@ -688,6 +701,29 @@ mod tests {
             // rather than requiring its spelling to differ from English.
             assert!(locale.0.messages().contains_key("toolbar.render_studio"));
             assert_eq!(locale.label("STUDIO"), locale.text("toolbar.render_studio"));
+            for id in [
+                "render.pick_label",
+                "render.pick_body",
+                "render.pick_face",
+                "render.pick_component",
+                "render.pick_help",
+                "render.tree_browser",
+                "render.tree_search",
+                "render.tree_more",
+                "render.studios_environments",
+                "render.frame_presets",
+                "render.size_presets",
+                "render.frame_presets_pending",
+                "render.size_presets_pending",
+                "render.search_appearances",
+                "render.library_applicable",
+                "render.library_other",
+                "render.library_apply_hint",
+                "render.studio_tiles_require_gpu",
+                "render.environment_tiles_require_raytrace",
+            ] {
+                assert_ne!(locale.text(id), Locale::for_language("en").text(id), "{language}: {id}");
+            }
             let session = solidcraft_engine::Session::default();
             for command in solidcraft_engine::command_specs().into_iter().filter(|c| c.planned.is_some() && crate::workspace::render_tab(c.tab)) {
                 assert_ne!(locale.label(command.label), command.label, "{language}: {}", command.id);
@@ -1084,6 +1120,9 @@ mod tests {
     #[test]
     fn new_languages_translate_keys_labels_and_default_names() {
         for (id, name, preferences, extrude, sketch1, save) in [
+            ("bs", "Bosanski", "Postavke", "Ekstrudiraj", "Skica1", "Sačuvati promjene u My {design}?"),
+            ("hr", "Hrvatski", "Postavke", "Ekstrudiraj", "Skica1", "Spremiti promjene u My {design}?"),
+            ("sr", "Српски", "Подешавања", "Екструдирај", "Скица1", "Сачувати промене у My {design}?"),
             ("hu", "Magyar", "Beállítások", "Kihúzás", "Vázlat1", "Menti a(z) My {design} módosításait?"),
             ("id", "Bahasa Indonesia", "Preferensi", "Ekstrusi", "Sketsa1", "Simpan perubahan ke My {design}?"),
             ("nl", "Nederlands", "Voorkeuren", "Extruderen", "Schets1", "Wijzigingen in My {design} opslaan?"),

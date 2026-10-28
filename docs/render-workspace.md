@@ -26,21 +26,52 @@ applies or saves settings or starts an image job. It focuses the existing Inspec
 page, while every Inspector page and registered Render command remains reachable.
 The headless command validates and echoes the request without changing the document.
 
-Render, Cancel and the shared command search (S) occupy the top row. The former Pick
-HUD, icon-text Body/Face/Component segments, Paint/Pick Up actions and direct-light
-preview information chip occupy Look's second row with 8 pt side padding. Picking and changing the
-light coordinate frame remain disabled with their reason in this checkout. Frame
+Render, Cancel and the shared command search (S) occupy the top row. The Pick control's
+icon-text Body/Face/Component segments, Paint/Pick Up actions and direct-light
+preview information chip occupy Look's second row with 8 pt side padding. Changing the
+light coordinate frame remains disabled with its reason in this checkout. Frame
 uses the existing explicit camera command for projection; Output shows the current
 size/format and directs edits to the Output Inspector. No completion ticks are inferred.
 
-The Browser and Inspector float in both shell layouts, share top and bottom edges,
-and clear the bar and Shots strip by 8 pt. Their default outer widths are 266 pt and 305 pt, with the shared resize bounds.
-The 48 pt Shots strip has an 8 pt gap from the docks. The 110 pt compass uses the
-free canvas beside the Inspector and the navigation bar keeps its shared navigation handler. Narrow
-rows scroll horizontally; docks shrink together or disappear if no usable space
-remains. The Shots strip's independent `view.shots_strip` preference is unchanged.
-The current model/library Browser can reveal model bodies for Look; scene-specific
-Lights, Shots and Output expansion awaits the scene Browser change.
+The Browser and Inspector float in both shell layouts and share a top edge, 8 pt
+below the bar. Their default outer widths are 266 pt and 305 pt, with shared resize
+bounds. The Browser keeps the upper left card (up to ten compact scene rows); its
+stage panel fills the remaining height below it, ending 8 pt above the 48 pt Shots
+strip. Both cards share width and side preferences. Narrow windows shorten the
+Browser to reserve library space, then omit cards that cannot fit safely.
+
+Look hosts Appearances: search with the actual catalog count, In Design / Library /
+Recent / favorites scopes, horizontally scrolling category chips and a three-column
+sphere grid or list. Resources used in the design or matching a selected look's
+finish family or category appear first. Clicking a look applies through
+`appearance.assign` to selected bodies, faces or components; with no target it
+only inspects. Favorites and recent history live in user preferences. Explicit
+catalog navigation from the Inspector retains the read-only resource browser.
+
+Light hosts the existing native studios and HDR environments in the same tile grid.
+A click runs `render.preset.apply` or `render.library.environment.apply`, preserving
+those commands' validation and undo behavior. Studios require an explicitly selected
+GPU path setup; environments require CPU or GPU ray tracing. Frame and Output show
+faded Frame presets / Size presets placeholders with their Shot editor / Output
+editor reasons. Stage navigation itself never applies a resource.
+
+The 110 pt compass uses the free canvas beside the Inspector; the navigation bar
+keeps its shared handler. The Shots strip's independent `view.shots_strip`
+preference is unchanged.
+
+`view.render_focus {on: true}` hides the Browser, Inspector and Shots strip and
+releases their canvas reservations. Tab toggles focus while Render is active and
+no text field has focus; the **Exit focus** chip sits at the Browser's remembered
+side below the stage bar. The workspace card, stage bar, compass and view bar
+remain available. Focus belongs to the window, is never saved in a design or
+preferences, and retains the docks' sides, widths and folded state.
+
+Below 1100 pt, or with `view.layout {mode: compact}`, the docks use their shared
+minimum width without overwriting the remembered width. Below 800 pt the Browser
+folds into a chip. Its floating card opens through
+`view.render_browser {open: true}` and closes through **Fold Browser**; it shields
+navigation beneath the card without reserving a canvas column. Neither command
+edits or evaluates the design, moves the camera or creates an undo step.
 
 ## Image methods and controls
 
@@ -148,9 +179,8 @@ resolved sRGB colours, opacity and face appearance overrides. Face indices are t
 existing mesh-to-B-rep mapping, resolved through document appearance references;
 they are not new persistent names or triangle-derived face identities.
 
-There are no grid/axis/edge lines, sketches, construction objects, selection or hover
-colours, section cuts, analysis shading, active-component fading, canvases or decals
-in this initial product policy. Browser visibility still controls which bodies appear.
+There are no grid/axis/edge lines, sketches, construction objects, section cuts,
+analysis shading, active-component fading, canvases or decals in the product scene. Browser visibility still controls which bodies appear.
 The existing Design viewport and CPU snapshot routes keep their current policies.
 
 Extraction refuses a stale live-drag model. The explicit model-reading `render.scene {}`
@@ -237,7 +267,7 @@ distance, yaw, pitch, roll, FOV and up axis as view state. It neither edits the 
 nor settles a stale model. The UI honours its up axis in Render; the Design camera
 is restored when returning. The camera moves exactly as in Design: the navigation preset,
 Orbit around, zoom to the cursor, the SpaceMouse, the middle double-click, F6 and the axis
-view or navigation cube all work (nothing is picked or selected here), and
+view or navigation cube all work and
 **Fit Product** frames visible product bodies without including sketches or selection.
 
 Preview drafts do not make the document dirty until saved. Unknown backend preferences
@@ -329,3 +359,41 @@ locale before falling back to English. Adding an untranslated Render alias no
 longer hides existing Library, Appearance or Checkpoint translations. Contextual
 Render labels still use their own stable IDs rather than borrowing a different
 feature's meaning.
+
+## Picking in the product view
+
+The Look stage bar's second-row **Pick** control selects Body, Face or Component granularity,
+using Design’s selection filter state through the `select.filter` command. Component
+picks use the Browser’s exact occurrence path, including nested and repeated
+placements; a body at the design root retains its body identity. Face picks use the
+existing mesh-to-B-rep mapping and connected-surface selection rules.
+
+Hover highlights the target; clicking selects it. Clicking empty space clears the
+selection. Shift and Ctrl/Cmd follow Design’s add/toggle behavior and the Shift
+add-only preference. Browser row selections and product picks share the same
+selection commands and state, retained across Design/Render switches. Picking works
+with the Shots strip shown or hidden. Render picking never starts a geometry edit.
+
+Selection and hover use Design’s highlight drawing and theme tokens in a separate
+GPU overlay on the live product view. The product scene and its upload stay unchanged.
+CPU image jobs, exported PNGs, retained images and the Render Result canvas never
+contain this overlay; the Pick control is disabled on the result canvas.
+
+## Browser scene focus
+
+The shared Browser lists Environment (with its source), Lights, saved Shots,
+Objects and Output (with image dimensions and format). Shots **+** opens the
+existing Shots manager; Lights **+**, Solo and Mute remain faded with an explicit
+reason until named light commands exist. Existing light entries describe the
+current numerical image setup, without inventing a saved rig.
+
+`ViewState.selection` exposes `RenderSelection` for Nothing, Object (the existing
+engine selection), Environment, Light, Shot and Output. It belongs to each document
+view and is never saved in a design. `view.render_select` validates semantic focus
+requests without opening dialogs or editing/evaluating a design. Object picks and
+Browser selections keep the existing selection commands. Inspector routing stays
+as before; the focus state is available to a later Inspector change.
+
+Look expands Objects, Light expands Lights and Environment, and Frame expands
+Shots. Output leaves expansion unchanged. Stages preserve selection and never
+lock rows or prevent manual expansion.

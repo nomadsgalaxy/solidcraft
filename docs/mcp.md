@@ -22,7 +22,7 @@ document remains the reference implementation today.
 solidcraft-cli mcp
 
 # Headless, starting from a design file or a command script.
-solidcraft-cli mcp --in part.solidcraft
+solidcraft-cli mcp --in part.sc
 
 # Bridged to the running app, so you can watch the agent model. The app's control channel is
 # on by default (see below), so no flag is needed on either side:
@@ -77,11 +77,19 @@ design is left as it was. Calls bridged to the app are not checked yet.
 
 Tool calls read, write and delete files only inside the server's folders:
 
-- the folder of the open design (the `--in` design, or whatever the agent last opened or saved),
-  but only when it lies strictly inside your home folder (or the temporary folder) and not in a
-  hidden folder. Home itself, a folder above it (`/`, `/home`, `/Users`, a drive's root),
-  hidden folders such as `~/.config` and folders elsewhere don't count. Hidden files and folders
-  inside the design's folder (`.env`, `.git`) are out of reach too;
+- the folder of the open design (the `--in` design, the design open in the app, or whatever
+  the agent last opened or saved), but only when it lies strictly inside your home folder (or
+  the temporary folder) and not in a hidden folder. Home itself, a folder above it (`/`,
+  `/home`, `/Users`, a drive's root), hidden folders such as `~/.config` and folders elsewhere
+  don't count. Hidden files and folders inside the design's folder (`.env`, `.git`) are out of
+  reach too;
+- on the same terms, every folder the agent opened or saved a design file in during this
+  server's run (`open`, `save`, or `doc.open`, `file.save` and `file.save_as` through `execute`
+  or `batch`, with the path given in full) and, headless, every folder a design was open in,
+  until the server stops (the 16 most recent). So after a new design, an opened STEP file or a
+  save-as elsewhere, the agent can still save beside the design it worked on. Such a call
+  succeeded only because its folder was already one of the agent's, so no folder joins just
+  because the agent names it;
 - SolidCraft's own recovery folder, so `doc.recovery_list`, `doc.recover` and
   `doc.recovery_discard` work out of the box (discarding deletes only real recovery entries);
 - the server's own scratch folder (a new private `solidcraft-mcp-*` folder in the temporary
@@ -116,7 +124,15 @@ solidcraft-cli mcp --allow-path ~/designs --allow-path ~/exports
 solidcraft-cli mcp --allow-any-path   # no limit (the behaviour before this option existed)
 ```
 
-Bridged, the server sends its folders with every request (`allow_paths`, see
+When a `save` (or any other call) is refused with `… outside the folders this agent may use …`,
+add the folder to the server's `args` in your MCP client's configuration (the `mcpServers`
+entries below, or what `solidcraft-cli mcp setup` wrote), for example
+`"args": ["mcp", "--allow-path", "/Users/NAME/Documents/Designs"]`, and restart the client.
+An agent should ask you to do that rather than save through the app's control port, which
+knows nothing of these folders.
+
+Bridged, the server sends its folders with every request (`allow_paths`, and the folders the
+agent opened or saved a design in as `design_folders`, see
 [control-protocol.md](control-protocol.md)) and the app adds its own recovery folder and the
 folder of the design open in it, under the same rules, so give absolute paths: a relative one
 resolves against the app's working folder, not the server's. The app's own
@@ -274,7 +290,7 @@ The `skill_reference` tool returns these documents from the copies built into So
 | `skill_reference` | `skill`, `file?` (default `reference.md`) | Read a bundled skill document. Skills: `solidcraft-modeling`, `solidcraft-mechanisms`, `solidcraft-editing`, `solidcraft-checking`. |
 | `running` | - | What the app is running or has queued, for every client (`control.running`, see [control-protocol.md](control-protocol.md#limits)): each request's connection and id, method, command id or a batch's step count, `running_s` and `queued`, never its parameters. Answers at once while the app is busy: ask it when a call timed out before sending a change again. Headless: always `{"running": []}`. |
 | `new_design` | `name?` | Start an empty design. |
-| `open` | `path` | Open a `.solidcraft` design, a STEP file (`.step`/`.stp`) as a new design holding its bodies (an Import base feature), or a 3MF/STL file as mesh bodies. |
+| `open` | `path` | Open a `.sc` design (or a `.solidcraft` one from an earlier release), a STEP file (`.step`/`.stp`) as a new design holding its bodies (an Import base feature), or a 3MF/STL file as mesh bodies. |
 | `save` | `path?` | Save the design (to its current file without `path`). |
 
 `measure` with `items` reports each item under `items` (`length_mm`, `area_mm2` or `position`).

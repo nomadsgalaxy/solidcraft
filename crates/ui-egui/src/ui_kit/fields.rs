@@ -168,6 +168,7 @@ pub(crate) fn searchable_dropdown(
     custom: Option<&str>,
     pending: Option<&str>,
 ) -> Option<String> {
+    crate::prefs_search::note_current(ui, current);
     let mut chosen = None;
     let row = label(ui).to_owned();
     let response = egui::ComboBox::from_id_salt(id)
@@ -270,7 +271,7 @@ pub(crate) fn dropdown(ui: &mut Ui, id: &str, selected: &mut usize, options: &[&
     dropdown_menu(ui, id, text, |ui| {
         for (index, option) in options.iter().enumerate() {
             let response = ui.selectable_value(selected, index, crate::i18n::tr_label(option));
-            scenario::publish_handle(&format!("dialog:{row}:{option}"), response.rect.center());
+            scenario::publish_target(&format!("dialog:{row}:{option}"), response.rect);
         }
     })
 }
@@ -290,6 +291,14 @@ pub(crate) fn dropdown_menu_with_close_behavior(
     close_behavior: egui::PopupCloseBehavior,
     add: impl FnOnce(&mut Ui),
 ) -> Response {
+    crate::prefs_search::note_current(ui, current);
+    // Only a search probe may skip the real control. A dialog's first frame is not visible yet,
+    // and a stand-in there makes the next frame too short to show OK.
+    if crate::prefs_search::querying(ui)
+        && (!ui.is_visible() || (crate::prefs_search::suppress_chrome(ui) && !crate::prefs_search::texts_hit(ui, &[current])))
+    {
+        return crate::prefs_search::hidden_response(ui);
+    }
     let response = egui::ComboBox::from_id_salt(id)
         .width(dimension(ui.available_width()))
         .height(Tokens::get().space_24 * 14.0)
@@ -446,7 +455,23 @@ fn cell_editor_frame(ui: &mut Ui, id: egui::Id, value: &mut String, hint: &str, 
 
 /// Search input with native accessibility and a stable caller ID. Tokens: cell_editor tokens.
 pub(crate) fn search_field(ui: &mut Ui, id: egui::Id, value: &mut String, hint: &str) -> Response {
-    cell_editor(ui, id, value, hint, false)
+    if !super::layout::in_catalog(ui) {
+        return cell_editor(ui, id, value, hint, false);
+    }
+    let t = Tokens::get();
+    let editor = text_input(egui::TextEdit::singleline(value))
+        .id(id)
+        .char_limit(128)
+        .hint_text(hint)
+        .min_size(vec2(0.0, t.space_16 + t.space_2))
+        .margin(egui::Margin { left: t.space_24 as i8, right: t.space_8 as i8, top: 0, bottom: 0 })
+        .font(egui::FontId::proportional(t.font_small))
+        .text_color(t.form_ink);
+    let response = ui.add_sized(vec2(dimension(ui.available_width()), t.space_16 + t.space_2), editor);
+    let icon = egui::Rect::from_center_size(egui::pos2(response.rect.left() + t.space_12, response.rect.center().y), vec2(t.space_12, t.space_12));
+    crate::icons::paint_ink(ui.painter(), icon, "zoom", t.form_dim);
+    super::layout::publish_geometry(ui, &response);
+    response
 }
 
 /// Behaviour of the one kit slider. Appearance is always owned by `slider`.
@@ -468,6 +493,9 @@ impl Default for Slider {
 /// Native input, keyboard routing, enabled state and accessibility; one token-painted track/thumb.
 /// Tokens: control_height, space_24/8/4/2, dialog_body/rule, control_fill, form_primary.
 pub(crate) fn slider<T: egui::emath::Numeric>(ui: &mut Ui, value: &mut T, range: std::ops::RangeInclusive<T>, options: Slider) -> Response {
+    if crate::prefs_search::suppress_chrome(ui) {
+        return crate::prefs_search::hidden_response(ui);
+    }
     // Own form styling even in callers such as the viewport menu which have no kit scope.
     super::scope(ui, |ui| {
         let t = Tokens::get();
@@ -498,6 +526,12 @@ pub(crate) fn slider<T: egui::emath::Numeric>(ui: &mut Ui, value: &mut T, range:
             widget = widget.integer();
         }
         let response = ui.add(widget);
+        if ui.ctx().memory(|memory| memory.focused()).is_some_and(|id| {
+            ui.ctx().read_response(id).is_some_and(|focused| response.rect.contains(focused.rect.center()))
+                || egui::TextEdit::load_state(ui.ctx(), id).is_some()
+        }) {
+            crate::prefs_search::note_key_sink(ui.ctx());
+        }
         let slider = egui::Rect::from_min_size(response.rect.min, vec2(ui.spacing().slider_width, response.rect.height()));
         let mut background = ui.painter().clone();
         background.set_opacity(if ui.is_visible() { 1.0 } else { 0.0 });
