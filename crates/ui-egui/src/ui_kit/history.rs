@@ -209,12 +209,8 @@ impl HistoryTransport {
         if response.hovered() {
             ui.painter().rect_filled(rect, t.radius_sm, t.hover);
         }
-        if self == Self::Play {
-            let icon = Rect::from_center_size(rect.center(), vec2(t.space_10 * 2.0, t.space_10 * 2.0));
-            icons::paint_icon(ui.painter(), icon, if playing { "timeline_stop" } else { "timeline_play" }, 1.0);
-        } else {
-            icons::glyphs::transport_glyph(ui.painter(), rect.center(), self.id(), t.icon);
-        }
+        let glyph = if self == Self::Play && playing { "pause" } else { self.id() };
+        icons::glyphs::transport_glyph(ui.painter(), rect.center(), glyph, t.icon);
         let label = self.label(playing);
         response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), label));
         response.on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text(label)
